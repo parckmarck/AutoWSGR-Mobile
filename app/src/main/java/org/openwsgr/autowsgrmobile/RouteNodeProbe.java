@@ -101,13 +101,18 @@ final class RouteNodeProbe {
         if (liveFrame == null) {
             return YellowShipScan.unavailable("live route node tracker unavailable: missing MediaProjection frame");
         }
+        Bitmap gameFrame = null;
         try {
-            RouteNodeTracker.ShipPositionDetection detection = RouteNodeTracker.detectShipPosition(liveFrame);
+            gameFrame = GameFrameNormalizer.toLandscapeGameFrame(liveFrame);
+            RouteNodeTracker.ShipPositionDetection detection = RouteNodeTracker.detectShipPosition(gameFrame);
             return new YellowShipScan(
                     detection.accepted,
                     "live route node tracker: " + detection.detail
             );
         } finally {
+            if (gameFrame != null) {
+                gameFrame.recycle();
+            }
             liveFrame.recycle();
         }
     }

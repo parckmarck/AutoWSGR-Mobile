@@ -54,8 +54,8 @@ final class ExpeditionCollectionRunner {
     static String startupSummary(AutoExpeditionConfig config) {
         AutoExpeditionConfig safe = config == null ? AutoExpeditionConfig.parseText("") : config;
         return "interval_seconds=" + safe.intervalSeconds
-                + ", collect_only=true"
-                + ", redispatch=false";
+                + ", collect_only=false"
+                + ", redispatch=true";
     }
 
     static String waitFailureOutcome(boolean cancelled, String timeoutReason) {
@@ -247,6 +247,7 @@ final class ExpeditionCollectionRunner {
 
     private void collectFromExpeditionPanel() {
         int collected = 0;
+        int lastUnclearedSlot = -1;
         while (!cancelled && collected < MAX_COLLECTIONS) {
             int slot = findReadySlot();
             if (slot < 0) {
@@ -283,8 +284,11 @@ final class ExpeditionCollectionRunner {
                 finishBlockedOrCancelled("tap-expedition-confirm-failed");
                 return;
             }
-            if (!expeditionNavigator.tapRedispatchCancel(expeditionCancelToken(), expeditionNavigatorLogger())) {
-                finishBlockedOrCancelled("tap-expedition-redispatch-cancel-failed");
+            // "继续远征 — 是否使用该编队继续远征" dialog: tap 确认 (yellow, left) to re-dispatch the same
+            // fleet. This matches the original AutoWSGR collect_expedition, whose confirm_operation
+            // clicks the yellow 确认 template (confirm_5_540p) and re-sends the expedition.
+            if (!expeditionNavigator.tapRedispatchConfirm(expeditionCancelToken(), expeditionNavigatorLogger())) {
+                finishBlockedOrCancelled("tap-expedition-redispatch-confirm-failed");
                 return;
             }
             MinimumGameStateRecognizer.Result map = waitForState(
@@ -296,7 +300,19 @@ final class ExpeditionCollectionRunner {
                 return;
             }
             collected++;
-            progress("自动远征：已收取远征", "collected=" + collected + "/" + MAX_COLLECTIONS);
+            boolean slotCleared = !slotStillReady(slot);
+            progress("自动远征：已收取远征", "collected=" + collected + "/" + MAX_COLLECTIONS
+                    + ", slot=" + slot
+                    + ", slotCleared=" + slotCleared);
+            if (slotCleared) {
+                lastUnclearedSlot = -1;
+            } else {
+                if (lastUnclearedSlot == slot) {
+                    finishBlocked("expedition-slot-" + slot + "-not-cleared");
+                    return;
+                }
+                lastUnclearedSlot = slot;
+            }
         }
         if (cancelled) {
             finishCancelled();
@@ -383,6 +399,28 @@ final class ExpeditionCollectionRunner {
                             return sampleFrame(frame, normalizedX, normalizedY);
                         }
                     }
+            );
+        } finally {
+            frame.recycle();
+            source.recycle();
+        }
+    }
+
+    private boolean slotStillReady(final int slot) {
+        final Bitmap source = ScreenFrameStore.latestBitmap();
+        if (source == null) {
+            return false;
+        }
+        final Bitmap frame = GameFrameNormalizer.toLandscapeGameFrame(source);
+        try {
+            return ExpeditionCollectionSignatures.slotReady(
+                    new ExpeditionCollectionSignatures.Sampler() {
+                        @Override
+                        public int sample(float normalizedX, float normalizedY) {
+                            return sampleFrame(frame, normalizedX, normalizedY);
+                        }
+                    },
+                    slot
             );
         } finally {
             frame.recycle();

@@ -90,6 +90,7 @@ public final class MainActivity extends Activity {
     private NormalMapCatalog normalMapCatalog;
     private MinimumNormalBattleRunner minimumNormalBattleRunner;
     private AutoExpeditionSchedulerRunner autoExpeditionSchedulerRunner;
+    private CampaignBattleRunner campaignBattleRunner;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -107,6 +108,7 @@ public final class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         cancelAutoExpeditionSchedulerSilently();
+        cancelCampaignBattleRunnerSilently();
         cancelMinimumNormalRunnerSilently();
         cancelGuardedRunner();
         cancelLiveCombatWait();
@@ -281,6 +283,12 @@ public final class MainActivity extends Activity {
             @Override
             public void onClick(View view) {
                 runAutoExpeditionScheduler();
+            }
+        }));
+        root.addView(button("战役", new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                runCampaignBattle();
             }
         }));
         root.addView(button("停止当前流程", new View.OnClickListener() {
@@ -722,6 +730,10 @@ public final class MainActivity extends Activity {
             liveCombatWaitStatus.setText("等待任务：自动远征正在运行");
             return;
         }
+        if (campaignBattleRunner != null && campaignBattleRunner.isRunning()) {
+            liveCombatWaitStatus.setText("等待任务：战役正在运行");
+            return;
+        }
         if (liveCombatFlowWaiter != null && liveCombatFlowWaiter.isRunning()) {
             liveCombatWaitStatus.setText("Live combat wait: already running");
             return;
@@ -849,6 +861,10 @@ public final class MainActivity extends Activity {
             guardedStepperStatus.setText("单步作战：自动远征正在运行");
             return;
         }
+        if (campaignBattleRunner != null && campaignBattleRunner.isRunning()) {
+            guardedStepperStatus.setText("单步作战：战役正在运行");
+            return;
+        }
         if (minimumNormalBattleRunner != null && minimumNormalBattleRunner.isRunning()) {
             guardedStepperStatus.setText("Guarded stepper: blocked by active minimum normal battle");
             return;
@@ -904,6 +920,10 @@ public final class MainActivity extends Activity {
     private void startGuardedRunner(GuardedCombatRunner runner) {
         if (isAutoExpeditionRunning()) {
             guardedRunnerStatus.setText("受保护作战：自动远征正在运行");
+            return;
+        }
+        if (campaignBattleRunner != null && campaignBattleRunner.isRunning()) {
+            guardedRunnerStatus.setText("受保护作战：战役正在运行");
             return;
         }
         if (minimumNormalBattleRunner != null && minimumNormalBattleRunner.isRunning()) {
@@ -975,6 +995,10 @@ public final class MainActivity extends Activity {
             minimumRunStatus.setText("最小普通战：自动远征正在运行");
             return;
         }
+        if (campaignBattleRunner != null && campaignBattleRunner.isRunning()) {
+            minimumRunStatus.setText("最小普通战：战役正在运行");
+            return;
+        }
         if (guardedCombatRunner != null && guardedCombatRunner.isRunning()) {
             minimumRunStatus.setText("最小普通战：受保护作战正在运行");
             return;
@@ -1010,6 +1034,10 @@ public final class MainActivity extends Activity {
     private void runAutoExpeditionScheduler() {
         if (isAutoExpeditionRunning()) {
             minimumRunStatus.setText("自动远征：正在运行");
+            return;
+        }
+        if (campaignBattleRunner != null && campaignBattleRunner.isRunning()) {
+            minimumRunStatus.setText("自动远征：战役正在运行");
             return;
         }
         if (minimumNormalBattleRunner != null && minimumNormalBattleRunner.isRunning()) {
@@ -1059,6 +1087,10 @@ public final class MainActivity extends Activity {
             cancelAutoExpeditionScheduler();
             return;
         }
+        if (campaignBattleRunner != null && campaignBattleRunner.isRunning()) {
+            cancelCampaignBattle();
+            return;
+        }
         if (minimumNormalBattleRunner != null && minimumNormalBattleRunner.isRunning()) {
             cancelMinimumNormalBattle();
             return;
@@ -1095,6 +1127,81 @@ public final class MainActivity extends Activity {
             autoExpeditionSchedulerRunner.cancel();
             autoExpeditionSchedulerRunner = null;
         }
+    }
+
+    private void runCampaignBattle() {
+        if (isAutoExpeditionRunning()) {
+            minimumRunStatus.setText("战役：自动远征正在运行");
+            return;
+        }
+        if (campaignBattleRunner != null && campaignBattleRunner.isRunning()) {
+            minimumRunStatus.setText("战役：正在运行");
+            return;
+        }
+        if (minimumNormalBattleRunner != null && minimumNormalBattleRunner.isRunning()) {
+            minimumRunStatus.setText("战役：最小普通战正在运行");
+            return;
+        }
+        if (guardedCombatRunner != null && guardedCombatRunner.isRunning()) {
+            minimumRunStatus.setText("战役：受保护作战正在运行");
+            return;
+        }
+        if (guardedCombatStepper != null && guardedCombatStepper.isRunning()) {
+            minimumRunStatus.setText("战役：单步作战正在运行");
+            return;
+        }
+        if (liveCombatFlowWaiter != null && liveCombatFlowWaiter.isRunning()) {
+            minimumRunStatus.setText("战役：等待任务正在运行");
+            return;
+        }
+        CampaignBattleConfigStore.LoadResult configResult;
+        try {
+            configResult = CampaignBattleConfigStore.loadOrCreateDefault(this);
+        } catch (IOException e) {
+            minimumRunStatus.setText("战役：配置不可用");
+            minimumRunDetail.setText(e.getMessage());
+            return;
+        }
+        campaignBattleRunner = new CampaignBattleRunner(this, configResult.config, campaignBattleCallback());
+        minimumRunStatus.setText("战役：启动中");
+        minimumRunDetail.setText("战役配置：" + configResult.detail);
+        minimumRunLogPath.setText("运行日志：准备生成");
+        minimumRunScreenshotPath.setText("失败截图：未生成");
+        if (!campaignBattleRunner.start()) {
+            campaignBattleRunner = null;
+            minimumRunStatus.setText("战役：启动失败");
+        }
+    }
+
+    private void cancelCampaignBattle() {
+        if (campaignBattleRunner == null) {
+            minimumRunStatus.setText("战役：没有运行中的流程");
+            return;
+        }
+        minimumRunStatus.setText("战役：请求停止");
+        campaignBattleRunner.cancel();
+    }
+
+    private void cancelCampaignBattleRunnerSilently() {
+        if (campaignBattleRunner != null) {
+            campaignBattleRunner.cancel();
+            campaignBattleRunner = null;
+        }
+    }
+
+    private CampaignBattleRunner.Callback campaignBattleCallback() {
+        return new CampaignBattleRunner.Callback() {
+            @Override
+            public void onUpdate(CampaignBattleRunner.Update update) {
+                minimumRunStatus.setText(update.status);
+                minimumRunDetail.setText(update.detail);
+                minimumRunLogPath.setText("运行日志：" + (TextUtils.isEmpty(update.logPath) ? "未生成" : update.logPath));
+                minimumRunScreenshotPath.setText("失败截图：" + (TextUtils.isEmpty(update.screenshotPath) ? "未生成" : update.screenshotPath));
+                if (!update.running) {
+                    campaignBattleRunner = null;
+                }
+            }
+        };
     }
 
     private void cancelMinimumNormalBattle() {

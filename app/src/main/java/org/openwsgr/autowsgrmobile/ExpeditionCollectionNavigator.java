@@ -10,8 +10,12 @@ final class ExpeditionCollectionNavigator {
     private static final float SKIP_RESULT_Y = 0.5f;
     private static final float CONFIRM_X = 0.62f;
     private static final float CONFIRM_Y = 0.78f;
-    private static final float REDISPATCH_CANCEL_X = 0.6190f;
-    private static final float REDISPATCH_CANCEL_Y = 0.6380f;
+    // "继续远征 — 是否使用该编队继续远征" dialog: 确认 (yellow) is the LEFT button, 取消 (red) the RIGHT.
+    // The Android port had the cancel button calibrated at (0.619, 0.638); the confirm button is its
+    // mirror across the centred dialog. Tapping 确认 re-dispatches the same fleet — matching the
+    // original AutoWSGR confirm_operation, which clicks the yellow 确认 template (confirm_5_540p).
+    private static final float REDISPATCH_CONFIRM_X = 0.381f;
+    private static final float REDISPATCH_CONFIRM_Y = 0.638f;
     private static final float RETURN_HOME_X = 0.050f;
     private static final float RETURN_HOME_Y = 0.055f;
 
@@ -39,8 +43,8 @@ final class ExpeditionCollectionNavigator {
         return new TapAction("expedition-skip", SKIP_RESULT_X, SKIP_RESULT_Y);
     }
 
-    static TapAction redispatchCancelTap() {
-        return new TapAction("expedition-redispatch-cancel", REDISPATCH_CANCEL_X, REDISPATCH_CANCEL_Y);
+    static TapAction redispatchConfirmTap() {
+        return new TapAction("expedition-redispatch-confirm", REDISPATCH_CONFIRM_X, REDISPATCH_CONFIRM_Y);
     }
 
     boolean tapExpeditionPanel(CancelToken cancel, Logger logger) {
@@ -59,8 +63,8 @@ final class ExpeditionCollectionNavigator {
         return tapGame(new TapAction("expedition-confirm", CONFIRM_X, CONFIRM_Y), cancel, logger);
     }
 
-    boolean tapRedispatchCancel(CancelToken cancel, Logger logger) {
-        return tapGame(redispatchCancelTap(), cancel, logger);
+    boolean tapRedispatchConfirm(CancelToken cancel, Logger logger) {
+        return tapGame(redispatchConfirmTap(), cancel, logger);
     }
 
     boolean tapReturnHome(CancelToken cancel, Logger logger) {

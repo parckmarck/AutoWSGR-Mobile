@@ -452,8 +452,10 @@ final class GuardedCombatRunner {
         if (liveFrame == null) {
             return new RouteSync(currentRouteIndex, "routeNodeScan=unavailable missing MediaProjection frame");
         }
+        Bitmap gameFrame = null;
         try {
-            RouteNodeTracker.RouteUpdate update = routeNodeTracker.updateFromFrame(liveFrame);
+            gameFrame = GameFrameNormalizer.toLandscapeGameFrame(liveFrame);
+            RouteNodeTracker.RouteUpdate update = routeNodeTracker.updateFromFrame(gameFrame);
             if (update.acceptedPosition && !planPolicy.isRouteNodeAllowed(update.currentNode)) {
                 return new RouteSync(
                         currentRouteIndex,
@@ -476,6 +478,9 @@ final class GuardedCombatRunner {
                             + ", trackerNode=" + update.currentNode
             );
         } finally {
+            if (gameFrame != null) {
+                gameFrame.recycle();
+            }
             liveFrame.recycle();
         }
     }
@@ -522,9 +527,11 @@ final class GuardedCombatRunner {
         if (liveFrame == null) {
             return new EnemyScan(null, null, "enemyScan=spot unavailable: missing MediaProjection frame");
         }
+        Bitmap gameFrame = null;
         try {
-            EnemyCompositionRecognizer.Detection detection = EnemyCompositionRecognizer.detectFight(liveFrame);
-            EnemyFormationRecognizer.Detection formation = EnemyFormationRecognizer.detectFight(liveFrame);
+            gameFrame = GameFrameNormalizer.toLandscapeGameFrame(liveFrame);
+            EnemyCompositionRecognizer.Detection detection = EnemyCompositionRecognizer.detectFight(gameFrame);
+            EnemyFormationRecognizer.Detection formation = EnemyFormationRecognizer.detectFight(gameFrame);
             String action = detection.reliable || formation.reliable
                     ? "accepted for spot rules"
                     : "ignored, default spot_fight";
@@ -536,6 +543,9 @@ final class GuardedCombatRunner {
                             + ", action=" + action
             );
         } finally {
+            if (gameFrame != null) {
+                gameFrame.recycle();
+            }
             liveFrame.recycle();
         }
     }
@@ -550,9 +560,11 @@ final class GuardedCombatRunner {
             return "damageScan=result unavailable: missing MediaProjection frame, current="
                     + damageSnapshot.shortLabel();
         }
+        Bitmap gameFrame = null;
         try {
+            gameFrame = GameFrameNormalizer.toLandscapeGameFrame(liveFrame);
             ShipDamageRecognizer.Detection detection = ShipDamageRecognizer.detectResult(
-                    liveFrame,
+                    gameFrame,
                     damageSnapshot
             );
             if (detection.reliable) {
@@ -562,6 +574,9 @@ final class GuardedCombatRunner {
                     + ", accepted=" + detection.reliable
                     + ", current=" + damageSnapshot.shortLabel();
         } finally {
+            if (gameFrame != null) {
+                gameFrame.recycle();
+            }
             liveFrame.recycle();
         }
     }

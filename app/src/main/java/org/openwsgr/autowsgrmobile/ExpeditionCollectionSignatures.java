@@ -18,6 +18,9 @@ final class ExpeditionCollectionSignatures {
     private static final int READY_SLOT_B = 66;
     private static final double NOTIFICATION_TOLERANCE = 40.0;
     private static final double READY_SLOT_TOLERANCE = 30.0;
+    // Small spatial radius (in normalized frame space, ~4px on a 960-wide frame) sampled around
+    // each calibrated probe so a slight per-device calibration drift no longer misses a solid badge.
+    private static final float NEIGHBOR_DELTA = 0.004f;
     private static final float[][] READY_SLOTS = new float[][]{
             {0.8516f, 0.2736f},
             {0.8531f, 0.4736f},
@@ -40,8 +43,10 @@ final class ExpeditionCollectionSignatures {
         if (sampler == null) {
             return false;
         }
-        return near(
-                sampler.sample(MAIN_READY_X, MAIN_READY_Y),
+        return nearAny(
+                sampler,
+                MAIN_READY_X,
+                MAIN_READY_Y,
                 MAIN_READY_R,
                 MAIN_READY_G,
                 MAIN_READY_B,
@@ -53,8 +58,10 @@ final class ExpeditionCollectionSignatures {
         if (sampler == null) {
             return false;
         }
-        return near(
-                sampler.sample(MAP_NOTIFICATION_X, MAP_NOTIFICATION_Y),
+        return nearAny(
+                sampler,
+                MAP_NOTIFICATION_X,
+                MAP_NOTIFICATION_Y,
                 MAP_NOTIFICATION_R,
                 MAP_NOTIFICATION_G,
                 MAP_NOTIFICATION_B,
@@ -67,17 +74,62 @@ final class ExpeditionCollectionSignatures {
             return -1;
         }
         for (int i = 0; i < READY_SLOTS.length; i++) {
-            if (near(
-                    sampler.sample(READY_SLOTS[i][0], READY_SLOTS[i][1]),
-                    READY_SLOT_R,
-                    READY_SLOT_G,
-                    READY_SLOT_B,
-                    READY_SLOT_TOLERANCE
-            )) {
+            if (slotReady(sampler, i)) {
                 return i;
             }
         }
         return -1;
+    }
+
+    static boolean slotReady(Sampler sampler, int index) {
+        if (sampler == null || index < 0 || index >= READY_SLOTS.length) {
+            return false;
+        }
+        return nearAny(
+                sampler,
+                READY_SLOTS[index][0],
+                READY_SLOTS[index][1],
+                READY_SLOT_R,
+                READY_SLOT_G,
+                READY_SLOT_B,
+                READY_SLOT_TOLERANCE
+        );
+    }
+
+    private static boolean nearAny(
+            Sampler sampler,
+            float centerX,
+            float centerY,
+            int expectedR,
+            int expectedG,
+            int expectedB,
+            double tolerance
+    ) {
+        float[][] offsets = new float[][]{
+                {0f, 0f},
+                {-NEIGHBOR_DELTA, -NEIGHBOR_DELTA},
+                {NEIGHBOR_DELTA, -NEIGHBOR_DELTA},
+                {-NEIGHBOR_DELTA, NEIGHBOR_DELTA},
+                {NEIGHBOR_DELTA, NEIGHBOR_DELTA}
+        };
+        for (float[] offset : offsets) {
+            float x = clampUnit(centerX + offset[0]);
+            float y = clampUnit(centerY + offset[1]);
+            if (near(sampler.sample(x, y), expectedR, expectedG, expectedB, tolerance)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static float clampUnit(float value) {
+        if (value < 0f) {
+            return 0f;
+        }
+        if (value > 1f) {
+            return 1f;
+        }
+        return value;
     }
 
     private static boolean near(int argb, int expectedR, int expectedG, int expectedB, double tolerance) {

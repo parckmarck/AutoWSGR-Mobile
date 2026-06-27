@@ -83,7 +83,7 @@ final class MinimumRunContractsTest {
         autoExpeditionSchedulerPolicyDisablesOverflowIntervals();
         autoExpeditionConfigReportsMalformedInterval();
         expeditionNavigatorTapPlanMatchesOriginalTargets();
-        expeditionNavigatorIncludesCollectOnlyRedispatchCancel();
+        expeditionNavigatorRedispatchConfirmTargetsLeftButton();
         expeditionRunnerSummaryMentionsCollectOnlySemantics();
         expeditionRunnerWaitFailurePrefersCancelledOverBlocked();
         expeditionRunnerReturnHomeOutcomeDoesNotReportSuccessAfterCancelOrTapFailure();
@@ -93,6 +93,15 @@ final class MinimumRunContractsTest {
         autoExpeditionSchedulerForwardsPassFinalAsRunningUntilSchedulerStops();
         autoExpeditionSchedulerWaitAndStopPreserveLatestEvidencePaths();
         autoExpeditionBlocksOtherFlowStarts();
+        expeditionSlotReadyVerificationHelperMatchesFindReadySlot();
+        expeditionReadySlotDetectorToleratesSmallSpatialDrift();
+        campaignCatalogMapsNamesToOriginalIndexAndDifficulty();
+        campaignSignaturesMatchOriginalProbes();
+        campaignDifficultyRecognizerUsesSourceColors();
+        campaignBattleConfigParsesAllFieldsAndDefaults();
+        campaignBattleConfigBuildsSingleNodePlanWithFormationAndNight();
+        campaignNavigatorTapTargetsMatchOriginal();
+        digitTemplateRecognizerMatchesSyntheticDigits();
     }
 
     private static void preflightBlocksMissingFrame() {
@@ -1491,18 +1500,18 @@ final class MinimumRunContractsTest {
         assertNear(0.5f, skip.gameY, 0.0001f);
     }
 
-    private static void expeditionNavigatorIncludesCollectOnlyRedispatchCancel() {
-        ExpeditionCollectionNavigator.TapAction cancel = ExpeditionCollectionNavigator.redispatchCancelTap();
-        assertEquals("expedition-redispatch-cancel", cancel.name);
-        assertNear(0.6190f, cancel.gameX, 0.0001f);
-        assertNear(0.6380f, cancel.gameY, 0.0001f);
-    }
-
     private static void expeditionRunnerSummaryMentionsCollectOnlySemantics() {
         String summary = ExpeditionCollectionRunner.startupSummary(AutoExpeditionConfig.parseText("interval_seconds: 900\n"));
         assertContains(summary, "interval_seconds=900");
-        assertContains(summary, "collect_only=true");
-        assertContains(summary, "redispatch=false");
+        assertContains(summary, "collect_only=false");
+        assertContains(summary, "redispatch=true");
+    }
+
+    private static void expeditionNavigatorRedispatchConfirmTargetsLeftButton() {
+        ExpeditionCollectionNavigator.TapAction confirm = ExpeditionCollectionNavigator.redispatchConfirmTap();
+        assertEquals("expedition-redispatch-confirm", confirm.name);
+        assertNear(0.381f, confirm.gameX, 0.0001f);
+        assertNear(0.638f, confirm.gameY, 0.0001f);
     }
 
     private static void expeditionRunnerWaitFailurePrefersCancelledOverBlocked() {
@@ -1531,7 +1540,7 @@ final class MinimumRunContractsTest {
         String summary = AutoExpeditionSchedulerRunner.startupSummary(AutoExpeditionConfig.parseText(""));
         assertContains(summary, "interval_seconds=900");
         assertContains(summary, "app_scoped=true");
-        assertContains(summary, "collect_only=true");
+        assertContains(summary, "collect_only=false");
     }
 
     private static void autoExpeditionSchedulerBoundsPassWaits() {
@@ -1587,6 +1596,219 @@ final class MinimumRunContractsTest {
                 AutoExpeditionSchedulerRunner.shouldBlockNewFlowForAutoExpedition(false),
                 "auto expedition stopped should not block other flow starts"
         );
+    }
+
+    private static void expeditionSlotReadyVerificationHelperMatchesFindReadySlot() {
+        ExpeditionCollectionSignatures.Sampler sampler = new ExpeditionCollectionSignatures.Sampler() {
+            @Override
+            public int sample(float normalizedX, float normalizedY) {
+                if (Math.abs(normalizedX - ExpeditionCollectionSignatures.readySlotX(2)) < 0.0001f
+                        && Math.abs(normalizedY - ExpeditionCollectionSignatures.readySlotY(2)) < 0.0001f) {
+                    return rgb(253, 228, 66);
+                }
+                return rgb(38, 147, 250);
+            }
+        };
+        assertEquals(2, ExpeditionCollectionSignatures.findReadySlot(sampler));
+        assertTrue(
+                ExpeditionCollectionSignatures.slotReady(sampler, 2),
+                "slotReady should agree with findReadySlot for the completed slot"
+        );
+        assertFalse(
+                ExpeditionCollectionSignatures.slotReady(sampler, 0),
+                "slotReady should report a non-completed slot as not ready"
+        );
+        assertFalse(
+                ExpeditionCollectionSignatures.slotReady(sampler, 9),
+                "slotReady should reject out-of-range slot indices"
+        );
+    }
+
+    private static void expeditionReadySlotDetectorToleratesSmallSpatialDrift() {
+        final float driftX = ExpeditionCollectionSignatures.readySlotX(1) + 0.004f;
+        final float driftY = ExpeditionCollectionSignatures.readySlotY(1) + 0.004f;
+        ExpeditionCollectionSignatures.Sampler sampler = new ExpeditionCollectionSignatures.Sampler() {
+            @Override
+            public int sample(float normalizedX, float normalizedY) {
+                if (Math.abs(normalizedX - driftX) < 0.0001f
+                        && Math.abs(normalizedY - driftY) < 0.0001f) {
+                    return rgb(253, 228, 66);
+                }
+                return rgb(38, 147, 250);
+            }
+        };
+        assertEquals(
+                1,
+                ExpeditionCollectionSignatures.findReadySlot(sampler),
+                "neighbor sampling should tolerate a small calibration drift off the exact probe"
+        );
+    }
+
+    private static void campaignCatalogMapsNamesToOriginalIndexAndDifficulty() {
+        CampaignCatalog.Target hardSub = CampaignCatalog.parse("困难潜艇");
+        assertEquals(5, hardSub.mapIndex);
+        assertEquals("hard", hardSub.difficulty);
+        CampaignCatalog.Target easyCarrier = CampaignCatalog.parse("简单航母");
+        assertEquals(4, easyCarrier.mapIndex);
+        assertEquals("easy", easyCarrier.difficulty);
+        assertEquals(1, CampaignCatalog.parse("困难驱逐").mapIndex);
+        assertEquals("困难潜艇", hardSub.label());
+        try {
+            CampaignCatalog.parse("无敌战列");
+            throw new AssertionError("unknown campaign name should fail");
+        } catch (IllegalArgumentException e) {
+            assertContains(e.getMessage(), "battle_type");
+        }
+    }
+
+    private static void campaignSignaturesMatchOriginalProbes() {
+        assertNear(0.5750f, CampaignSignatures.BATTLE_PANEL_X, 0.0001f);
+        assertNear(0.0458f, CampaignSignatures.BATTLE_PANEL_Y, 0.0001f);
+        assertNear(0.800f, CampaignSignatures.CLICK_DIFFICULTY_X, 0.0001f);
+        assertNear(0.130f, CampaignSignatures.CLICK_DIFFICULTY_Y, 0.0001f);
+        assertEquals(5, CampaignSignatures.CAMPAIGN_COUNT);
+        assertNear(0.17f, CampaignSignatures.campaignX(1), 0.0001f);
+        assertNear(0.5f, CampaignSignatures.campaignY(1), 0.0001f);
+        assertNear(0.85f, CampaignSignatures.campaignX(5), 0.0001f);
+    }
+
+    private static void campaignDifficultyRecognizerUsesSourceColors() {
+        CampaignSignatures.Sampler blue = new CampaignSignatures.Sampler() {
+            @Override
+            public int sample(float normalizedX, float normalizedY) {
+                return rgb(29, 139, 234);
+            }
+        };
+        CampaignSignatures.Sampler red = new CampaignSignatures.Sampler() {
+            @Override
+            public int sample(float normalizedX, float normalizedY) {
+                return rgb(141, 46, 52);
+            }
+        };
+        assertEquals("hard", CampaignSignatures.recognizeDifficulty(blue));
+        assertEquals("easy", CampaignSignatures.recognizeDifficulty(red));
+        assertEquals(null, CampaignSignatures.recognizeDifficulty(new CampaignSignatures.Sampler() {
+            @Override
+            public int sample(float normalizedX, float normalizedY) {
+                return rgb(0, 0, 0);
+            }
+        }));
+    }
+
+    private static void campaignBattleConfigParsesAllFieldsAndDefaults() {
+        CampaignBattleConfig defaults = CampaignBattleConfig.parseText("");
+        assertEquals("困难潜艇", defaults.battleType);
+        assertEquals(3, defaults.times);
+        assertEquals(2, defaults.formation);
+        assertTrue(defaults.night, "night should default to true");
+        assertEquals("moderate", defaults.repairMode);
+
+        CampaignBattleConfig parsed = CampaignBattleConfig.parseText(
+                "battle_type: 简单航母\n"
+                        + "times: 2\n"
+                        + "formation: 轮型\n"
+                        + "night: false\n"
+                        + "repair_mode: severe\n"
+        );
+        assertEquals("简单航母", parsed.battleType);
+        assertEquals(2, parsed.times);
+        assertEquals(3, parsed.formation);
+        assertFalse(parsed.night, "night: false should disable night battle");
+        assertEquals("severe", parsed.repairMode);
+
+        CampaignBattleConfig noRepair = CampaignBattleConfig.parseText("repair_mode: none\n");
+        assertEquals("none", noRepair.repairMode);
+        assertEquals(-1, noRepair.repairThreshold());
+        assertEquals(1, CampaignBattleConfig.parseText("repair_mode: moderate\n").repairThreshold());
+        assertEquals(2, parsed.repairThreshold());
+
+        try {
+            CampaignBattleConfig.parseText("battle_type: 无效战役\n");
+            throw new AssertionError("invalid battle_type should fail");
+        } catch (IllegalArgumentException e) {
+            assertContains(e.getMessage(), "battle_type");
+        }
+        try {
+            CampaignBattleConfig.parseText("formation: 9\n");
+            throw new AssertionError("out-of-range formation should fail");
+        } catch (IllegalArgumentException e) {
+            assertContains(e.getMessage(), "formation");
+        }
+        try {
+            CampaignBattleConfig.parseText("repair_mode: 随便\n");
+            throw new AssertionError("invalid repair_mode should fail");
+        } catch (IllegalArgumentException e) {
+            assertContains(e.getMessage(), "repair_mode");
+        }
+    }
+
+    private static void campaignBattleConfigBuildsSingleNodePlanWithFormationAndNight() {
+        try {
+            CampaignBattleConfig config = CampaignBattleConfig.parseText(
+                    "battle_type: 困难航母\nformation: 4\nnight: true\n"
+            );
+            CombatPlanPolicy policy = CombatPlanPolicy.parseText(config.planPath(), config.toPlanText());
+            assertEquals(1, policy.fleetId, "campaign uses current fleet (plan defaults fleet_id=1)");
+            assertEquals("formation_4", policy.decisionForPhase(NativeCombatPhase.FORMATION, 0).actionId);
+            assertEquals("night_yes", policy.decisionForPhase(NativeCombatPhase.NIGHT_PROMPT, 0).actionId);
+
+            CampaignBattleConfig noNight = CampaignBattleConfig.parseText(
+                    "battle_type: 困难航母\nformation: 1\nnight: false\n"
+            );
+            CombatPlanPolicy noNightPolicy = CombatPlanPolicy.parseText(noNight.planPath(), noNight.toPlanText());
+            assertEquals("formation_1", noNightPolicy.decisionForPhase(NativeCombatPhase.FORMATION, 0).actionId);
+            assertEquals("night_no", noNightPolicy.decisionForPhase(NativeCombatPhase.NIGHT_PROMPT, 0).actionId);
+        } catch (java.io.IOException e) {
+            throw new AssertionError(e);
+        }
+    }
+
+    private static void campaignNavigatorTapTargetsMatchOriginal() {
+        CampaignBattleNavigator.TapAction panel = CampaignBattleNavigator.battlePanelTap();
+        assertEquals("campaign-battle-panel", panel.name);
+        assertNear(0.5750f, panel.gameX, 0.0001f);
+        assertNear(0.0458f, panel.gameY, 0.0001f);
+
+        CampaignBattleNavigator.TapAction toggle = CampaignBattleNavigator.difficultyToggleTap();
+        assertNear(0.800f, toggle.gameX, 0.0001f);
+        assertNear(0.130f, toggle.gameY, 0.0001f);
+
+        CampaignBattleNavigator.TapAction campaign = CampaignBattleNavigator.campaignTap(5);
+        assertEquals("campaign-select-5", campaign.name);
+        assertNear(0.85f, campaign.gameX, 0.0001f);
+        assertNear(0.5f, campaign.gameY, 0.0001f);
+    }
+
+    private static void digitTemplateRecognizerMatchesSyntheticDigits() {
+        int[][] templates = new int[10][DigitTemplateRecognizer.CELL_SIZE];
+        for (int d = 0; d < 10; d++) {
+            for (int i = 0; i < DigitTemplateRecognizer.CELL_SIZE; i++) {
+                templates[d][i] = (d * 37 + i * 13) & 0xff;
+            }
+        }
+        // 精确匹配
+        assertEquals(5, DigitTemplateRecognizer.recognizeDigit(templates[5].clone(), templates, 0.9));
+        // 带噪声(±6)仍正确
+        int[] noisy = templates[7].clone();
+        for (int i = 0; i < noisy.length; i++) {
+            int delta = (i % 2 == 0) ? 6 : -6;
+            noisy[i] = Math.max(0, Math.min(255, noisy[i] + delta));
+        }
+        assertEquals(7, DigitTemplateRecognizer.recognizeDigit(noisy, templates, 0.9));
+        // 均匀灰 → 未知
+        int[] flat = new int[DigitTemplateRecognizer.CELL_SIZE];
+        java.util.Arrays.fill(flat, 128);
+        assertEquals(-1, DigitTemplateRecognizer.recognizeDigit(flat, templates, 0.9));
+        // 尺寸不符 → 未知
+        assertEquals(-1, DigitTemplateRecognizer.recognizeDigit(new int[]{1, 2, 3}, templates, 0.9));
+        // 多位拼接
+        int[][] cells = new int[][]{templates[1].clone(), templates[2].clone(), templates[3].clone()};
+        assertEquals("123", DigitTemplateRecognizer.recognizeNumber(cells, templates, 0.9));
+        assertEquals(123, DigitTemplateRecognizer.parseNumber("123"));
+        assertEquals(-1, DigitTemplateRecognizer.parseNumber("1?3"));
+        // 相似度边界
+        assertTrue(DigitTemplateRecognizer.similarity(templates[0], templates[0]) >= 0.999,
+                "identical grids should score ~1.0");
     }
 
     private static MinimumBattlePageSignatures.Sampler sampler(final float[][] samples) {

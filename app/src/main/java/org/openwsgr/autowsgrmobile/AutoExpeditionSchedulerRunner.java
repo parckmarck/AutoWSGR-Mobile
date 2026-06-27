@@ -32,7 +32,7 @@ final class AutoExpeditionSchedulerRunner {
         AutoExpeditionConfig safe = config == null ? AutoExpeditionConfig.parseText("") : config;
         return "interval_seconds=" + safe.intervalSeconds
                 + ", app_scoped=true"
-                + ", collect_only=true";
+                + ", collect_only=false";
     }
 
     static boolean shouldBlockNewFlowForAutoExpedition(boolean autoRunning) {

@@ -26,9 +26,11 @@ final class LiveCombatFlowProbe {
         NativeCombatPhase[] pixelCandidates = pixelOnly(successors);
         int skipped = successors.length - pixelCandidates.length;
 
+        Bitmap gameFrame = null;
         try {
+            gameFrame = GameFrameNormalizer.toLandscapeGameFrame(liveFrame);
             NativeCombatRecognizer.Recognition recognition = NativeCombatRecognizer.identifyCurrent(
-                    liveFrame,
+                    gameFrame,
                     store,
                     pixelCandidates,
                     4,
@@ -36,7 +38,9 @@ final class LiveCombatFlowProbe {
             );
 
             StringBuilder detail = new StringBuilder();
-            append(detail, "live frame=" + liveFrame.getWidth() + "x" + liveFrame.getHeight());
+            append(detail, "live frame=" + liveFrame.getWidth() + "x" + liveFrame.getHeight()
+                    + ", scanInput=" + GameFrameNormalizer.phaseScanInputLabel()
+                    + " " + gameFrame.getWidth() + "x" + gameFrame.getHeight());
             append(detail, "flow current=" + current.id
                     + ", action=" + action
                     + ", successors=" + NativeCombatTransitions.format(successors));
@@ -46,6 +50,9 @@ final class LiveCombatFlowProbe {
 
             return new Result(pixelCandidates.length > 0, detail.toString());
         } finally {
+            if (gameFrame != null) {
+                gameFrame.recycle();
+            }
             liveFrame.recycle();
         }
     }
