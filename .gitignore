@@ -3,3 +3,4 @@ build/
 *.apk
 *.idsig
 local.properties
+.worktrees/
