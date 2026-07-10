@@ -4,3 +4,5 @@ build/
 *.idsig
 local.properties
 .worktrees/
+.gradle/
+app/build/
