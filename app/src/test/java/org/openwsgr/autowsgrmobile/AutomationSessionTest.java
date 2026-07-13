@@ -221,8 +221,9 @@ public final class AutomationSessionTest {
                 "nested-pass.log", "nested-pass.png"
         );
 
-        session.adoptEvidence(nested);
-        session.progress("调度中", "forwarded pass");
+        AutomationSession.NestedEvidenceScope scope =
+                session.beginNestedEvidence("pass-cancel-evidence");
+        assertTrue(session.progressFromNested(scope, nested, "调度中", "forwarded pass"));
         session.cancel();
         assertTrue(session.finish(
                 AutomationOutcome.FAILED, "本轮失败", "cancel won", true
@@ -236,6 +237,91 @@ public final class AutomationSessionTest {
         assertEquals("nested-pass.log", updates.get(1).logPath);
         assertEquals("nested-pass.png", updates.get(1).screenshotPath);
         assertEquals("cancel must not replace adopted evidence with a failure capture",
+                0, sink.saveCalls.get());
+    }
+
+    @Test public void newNestedPassClearsOldScreenshotAndFailureCapturesFreshEvidence() {
+        FreshEvidenceSink sink = new FreshEvidenceSink("fresh.png");
+        List<AutomationUpdate> updates = new ArrayList<>();
+        AutomationSession session = new AutomationSession(
+                "expedition", "scheduler-two-pass", new AutomationControl(), sink, updates::add
+        );
+        AutomationSession.NestedEvidenceScope passOne =
+                session.beginNestedEvidence("pass-1");
+        assertTrue(session.progressFromNested(
+                passOne,
+                AutomationUpdate.progress(
+                        "expedition", "pass-1", "第一轮", "done",
+                        "pass1.log", "old.png"
+                ),
+                "调度第一轮", "pass=1"
+        ));
+
+        AutomationSession.NestedEvidenceScope passTwo =
+                session.beginNestedEvidence("pass-2");
+        assertFalse("late pass-one evidence must not reclaim the active scope",
+                session.progressFromNested(
+                        passOne,
+                        AutomationUpdate.terminal(
+                                "expedition", "pass-1", AutomationOutcome.FAILED,
+                                "迟到", "late", "late-pass1.log", "late-old.png"
+                        ),
+                        "迟到第一轮", "pass=1 late"
+                ));
+        assertTrue(session.progressFromNested(
+                passTwo,
+                AutomationUpdate.terminal(
+                        "expedition", "pass-2", AutomationOutcome.FAILED,
+                        "第二轮失败", "no screenshot", "pass2.log", ""
+                ),
+                "调度第二轮", "pass=2 failed"
+        ));
+
+        assertTrue(session.finish(
+                AutomationOutcome.FAILED, "调度失败", "pass=2", true
+        ));
+
+        assertEquals(1, sink.saveCalls.get());
+        AutomationUpdate terminal = updates.get(updates.size() - 1);
+        assertEquals(AutomationOutcome.FAILED, terminal.outcome);
+        assertEquals("pass2.log", terminal.logPath);
+        assertEquals("fresh.png", terminal.screenshotPath);
+        assertFalse("the late prior-pass callback must not publish progress",
+                containsMessage(updates, "迟到第一轮"));
+    }
+
+    @Test public void currentNestedPassNonEmptyEvidenceReplacesPriorPassEvidence() {
+        RecordingSink sink = new RecordingSink();
+        List<AutomationUpdate> updates = new ArrayList<>();
+        AutomationSession session = new AutomationSession(
+                "expedition", "scheduler-replace", new AutomationControl(), sink, updates::add
+        );
+        AutomationSession.NestedEvidenceScope passOne =
+                session.beginNestedEvidence("pass-1");
+        assertTrue(session.progressFromNested(
+                passOne,
+                AutomationUpdate.progress(
+                        "expedition", "pass-1", "第一轮", "old",
+                        "pass1.log", "old.png"
+                ),
+                "第一轮", "old"
+        ));
+        AutomationSession.NestedEvidenceScope passTwo =
+                session.beginNestedEvidence("pass-2");
+        assertTrue(session.progressFromNested(
+                passTwo,
+                AutomationUpdate.terminal(
+                        "expedition", "pass-2", AutomationOutcome.FAILED,
+                        "第二轮", "new", "pass2.log", "new.png"
+                ),
+                "第二轮", "new"
+        ));
+
+        assertTrue(session.finish(AutomationOutcome.FAILED, "失败", "pass=2", true));
+        AutomationUpdate terminal = updates.get(updates.size() - 1);
+        assertEquals("pass2.log", terminal.logPath);
+        assertEquals("new.png", terminal.screenshotPath);
+        assertEquals("current non-empty screenshot needs no parent recapture",
                 0, sink.saveCalls.get());
     }
 
@@ -261,6 +347,15 @@ public final class AutomationSessionTest {
             }
         }
         return count;
+    }
+
+    private static boolean containsMessage(List<AutomationUpdate> updates, String message) {
+        for (AutomationUpdate update : updates) {
+            if (message.equals(update.message)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static boolean awaitThreadState(Thread thread, Thread.State state, long timeoutMs)
@@ -303,5 +398,22 @@ public final class AutomationSessionTest {
 
         @Override public String logPath() { return "finish-first.log"; }
         @Override public String saveFailure(String runId) { return "finish-first.png"; }
+    }
+
+    private static final class FreshEvidenceSink implements AutomationSession.Sink {
+        final AtomicInteger saveCalls = new AtomicInteger();
+        final String savedPath;
+
+        FreshEvidenceSink(String savedPath) {
+            this.savedPath = savedPath;
+        }
+
+        @Override public void append(String line) throws IOException { }
+        @Override public String logPath() { return "parent.log"; }
+
+        @Override public String saveFailure(String runId) {
+            saveCalls.incrementAndGet();
+            return savedPath;
+        }
     }
 }

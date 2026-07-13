@@ -29,6 +29,31 @@ final class MinimumNormalBattleRunner {
     private CombatPlanPolicy selectedPolicy;
     private boolean running;
 
+    static AutomationOutcome nestedGuardedOutcome(AutomationOutcome outcome) {
+        if (outcome == null) {
+            return AutomationOutcome.BLOCKED;
+        }
+        switch (outcome) {
+            case DOCK_FULL:
+                return AutomationOutcome.DOCK_FULL;
+            case SUCCESS:
+                return AutomationOutcome.SUCCESS;
+            case CANCELLED:
+                return AutomationOutcome.CANCELLED;
+            case FAILED:
+                return AutomationOutcome.FAILED;
+            case BLOCKED:
+                return AutomationOutcome.BLOCKED;
+            case EXHAUSTED:
+                return AutomationOutcome.EXHAUSTED;
+            case NO_ACTION:
+                return AutomationOutcome.NO_ACTION;
+            case RUNNING:
+            default:
+                return AutomationOutcome.RUNNING;
+        }
+    }
+
     MinimumNormalBattleRunner(Context context, AutomationCallback callback) {
         this(context, NormalSortieTarget.of(1, 1), callback);
     }
@@ -221,7 +246,7 @@ final class MinimumNormalBattleRunner {
                 finishCancelled();
                 return null;
             }
-            if (!navigator.tapStartScreenEnter(cancelToken(), session::checkpoint, navigatorLogger())) {
+            if (!navigator.tapStartScreenEnter(cancelToken(), session.actionBoundary(), navigatorLogger())) {
                 finishBlockedOrCancelled("tap-start-screen-enter-failed");
                 return null;
             }
@@ -237,7 +262,7 @@ final class MinimumNormalBattleRunner {
             finishCancelled();
             return;
         }
-        if (!navigator.tapHomeMap(home, cancelToken(), session::checkpoint, navigatorLogger())) {
+        if (!navigator.tapHomeMap(home, cancelToken(), session.actionBoundary(), navigatorLogger())) {
             finishBlockedOrCancelled("tap-home-map-failed");
             return;
         }
@@ -258,7 +283,7 @@ final class MinimumNormalBattleRunner {
             return;
         }
         if (!navigator.navigateToTarget(
-                sortieTarget, cancelToken(), session::checkpoint, navigatorLogger())) {
+                sortieTarget, cancelToken(), session.actionBoundary(), navigatorLogger())) {
             finishBlockedOrCancelled("navigate-map-target-" + sortieTarget.label() + "-failed");
             return;
         }
@@ -282,7 +307,7 @@ final class MinimumNormalBattleRunner {
             return;
         }
         if (!navigator.tapEnterSortie(
-                sortieTarget, cancelToken(), session::checkpoint, navigatorLogger())) {
+                sortieTarget, cancelToken(), session.actionBoundary(), navigatorLogger())) {
             finishBlockedOrCancelled("tap-enter-sortie-failed");
             return;
         }
@@ -292,7 +317,7 @@ final class MinimumNormalBattleRunner {
                 finishCancelled();
                 return;
             }
-            if (!navigator.tapMapStartNode(cancelToken(), session::checkpoint, navigatorLogger())) {
+            if (!navigator.tapMapStartNode(cancelToken(), session.actionBoundary(), navigatorLogger())) {
                 finishBlockedOrCancelled("tap-map-start-node-failed");
                 return;
             }
@@ -316,13 +341,13 @@ final class MinimumNormalBattleRunner {
             }
             boolean tapped;
             if (step == MinimumBattleAdvancePolicy.Step.START_SORTIE) {
-                tapped = navigator.tapStartBattle(cancelToken(), session::checkpoint, navigatorLogger());
+                tapped = navigator.tapStartBattle(cancelToken(), session.actionBoundary(), navigatorLogger());
             } else if (step == MinimumBattleAdvancePolicy.Step.ENEMY_START_BATTLE) {
                 tapped = navigator.tapEnemyStartBattle(
-                        cancelToken(), session::checkpoint, navigatorLogger());
+                        cancelToken(), session.actionBoundary(), navigatorLogger());
             } else {
                 tapped = navigator.tapDefaultFormation(
-                        cancelToken(), session::checkpoint, navigatorLogger());
+                        cancelToken(), session.actionBoundary(), navigatorLogger());
             }
             if (!tapped) {
                 finishBlockedOrCancelled("tap-" + step.name().toLowerCase().replace('_', '-') + "-failed");
@@ -351,7 +376,7 @@ final class MinimumNormalBattleRunner {
             progress("最小普通战：战斗批次结束", "batch=" + batch
                     + ", outcome=" + finalUpdate.outcome
                     + ", message=" + finalUpdate.message);
-            switch (finalUpdate.outcome) {
+            switch (nestedGuardedOutcome(finalUpdate.outcome)) {
                 case SUCCESS:
                     finishSuccess(finalUpdate.message + ", " + finalUpdate.detail);
                     return;
@@ -407,13 +432,16 @@ final class MinimumNormalBattleRunner {
 
     private AutomationUpdate runGuardedBatch(final int batch) {
         final GuardedResult guardedResult = new GuardedResult();
+        final AutomationSession.NestedEvidenceScope evidenceScope =
+                session.beginNestedEvidence("normal-guarded-batch-" + batch);
         GuardedCombatRunner runner = GuardedCombatRunner.boundedLoopExecuteGuarded(
                 appContext,
                 selectedPolicy,
                 new AutomationCallback() {
                     @Override
                     public void onUpdate(AutomationUpdate update) {
-                        session.progressFromNested(update, "最小普通战：战斗中", "batch=" + batch
+                        session.progressFromNested(evidenceScope, update,
+                                "最小普通战：战斗中", "batch=" + batch
                                 + ", outcome=" + update.outcome
                                 + ", message=" + update.message
                                 + ", detail=" + update.detail);
@@ -565,7 +593,7 @@ final class MinimumNormalBattleRunner {
                     return;
                 }
                 if (!navigator.tapNightPrompt(
-                        pursue, cancelToken(), session::checkpoint, navigatorLogger())) {
+                        pursue, cancelToken(), session.actionBoundary(), navigatorLogger())) {
                     finishBlockedOrCancelled("tap-night-prompt-" + actionId + "-failed");
                     return;
                 }

@@ -206,7 +206,7 @@ final class ExpeditionCollectionRunner {
                 return null;
             }
             if (!homeNavigator.tapStartScreenEnter(
-                    homeCancelToken(), session::checkpoint, homeNavigatorLogger())) {
+                    homeCancelToken(), session.actionBoundary(), homeNavigatorLogger())) {
                 finishBlockedOrCancelled("tap-start-screen-enter-failed");
                 return null;
             }
@@ -233,7 +233,7 @@ final class ExpeditionCollectionRunner {
             return;
         }
         if (!homeNavigator.tapHomeMap(
-                home, homeCancelToken(), session::checkpoint, homeNavigatorLogger())) {
+                home, homeCancelToken(), session.actionBoundary(), homeNavigatorLogger())) {
             finishBlockedOrCancelled("tap-home-map-failed");
             return;
         }
@@ -266,6 +266,7 @@ final class ExpeditionCollectionRunner {
             }
             boolean returnedHome = expeditionNavigator.tapReturnHome(
                     expeditionCancelToken(),
+                    session.actionBoundary(),
                     expeditionNavigatorLogger()
             );
             String outcome = returnHomeOutcome(session.cancelled(), true, returnedHome);
@@ -284,7 +285,8 @@ final class ExpeditionCollectionRunner {
             finishCancelled();
             return;
         }
-        if (!expeditionNavigator.tapExpeditionPanel(expeditionCancelToken(), expeditionNavigatorLogger())) {
+        if (!expeditionNavigator.tapExpeditionPanel(
+                expeditionCancelToken(), session.actionBoundary(), expeditionNavigatorLogger())) {
             finishBlockedOrCancelled("tap-expedition-panel-failed");
             return;
         }
@@ -346,7 +348,9 @@ final class ExpeditionCollectionRunner {
                 finishCancelled();
                 return;
             }
-            if (!expeditionNavigator.tapReadySlot(slot, expeditionCancelToken(), expeditionNavigatorLogger())) {
+            if (!expeditionNavigator.tapReadySlot(
+                    slot, expeditionCancelToken(), session.actionBoundary(),
+                    expeditionNavigatorLogger())) {
                 finishBlockedOrCancelled("tap-expedition-slot-" + slot + "-failed");
                 return;
             }
@@ -355,7 +359,8 @@ final class ExpeditionCollectionRunner {
                 finishCancelled();
                 return;
             }
-            if (!expeditionNavigator.tapSkipResult(expeditionCancelToken(), expeditionNavigatorLogger())) {
+            if (!expeditionNavigator.tapSkipResult(
+                    expeditionCancelToken(), session.actionBoundary(), expeditionNavigatorLogger())) {
                 finishBlockedOrCancelled("tap-expedition-skip-failed");
                 return;
             }
@@ -364,7 +369,8 @@ final class ExpeditionCollectionRunner {
                 finishCancelled();
                 return;
             }
-            if (!expeditionNavigator.tapConfirm(expeditionCancelToken(), expeditionNavigatorLogger())) {
+            if (!expeditionNavigator.tapConfirm(
+                    expeditionCancelToken(), session.actionBoundary(), expeditionNavigatorLogger())) {
                 finishBlockedOrCancelled("tap-expedition-confirm-failed");
                 return;
             }
@@ -375,7 +381,8 @@ final class ExpeditionCollectionRunner {
                 finishCancelled();
                 return;
             }
-            if (!expeditionNavigator.tapRedispatchConfirm(expeditionCancelToken(), expeditionNavigatorLogger())) {
+            if (!expeditionNavigator.tapRedispatchConfirm(
+                    expeditionCancelToken(), session.actionBoundary(), expeditionNavigatorLogger())) {
                 finishBlockedOrCancelled("tap-expedition-redispatch-confirm-failed");
                 return;
             }
@@ -603,7 +610,7 @@ final class ExpeditionCollectionRunner {
                         overlay.kind,
                         overlay.newsNotShowChecked,
                         overlayCancelToken(),
-                        session::checkpoint,
+                        session.actionBoundary(),
                         overlayNavigatorLogger()
                 )) {
                     finishBlockedOrCancelled("dismiss-main-overlay-failed, overlay=" + overlay.kind);

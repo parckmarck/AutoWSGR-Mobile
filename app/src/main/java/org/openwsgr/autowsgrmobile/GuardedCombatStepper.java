@@ -204,7 +204,7 @@ final class GuardedCombatStepper {
     private final String planDetail;
     private final AutomationControl control = new AutomationControl();
     private final OneShotStartGate startGate = new OneShotStartGate();
-    private LiveCombatFlowWaiter waiter;
+    private final WaiterLifecycle waiterLifecycle = new WaiterLifecycle();
     private Thread worker;
     private boolean running;
     private boolean terminalPosted;
@@ -499,12 +499,16 @@ final class GuardedCombatStepper {
         return true;
     }
 
-    synchronized void cancel() {
-        control.cancel();
-        if (waiter != null) {
-            waiter.cancel();
+    void cancel() {
+        waiterLifecycle.cancelWith(new Runnable() {
+            @Override public void run() {
+                control.cancel();
+            }
+        });
+        Thread active;
+        synchronized (this) {
+            active = worker;
         }
-        Thread active = worker;
         if (active != null) {
             active.interrupt();
         }
@@ -685,7 +689,7 @@ final class GuardedCombatStepper {
     }
 
     private void startWaiter() {
-        waiter = LiveCombatFlowWaiter.mapCustom(
+        final LiveCombatFlowWaiter waiter = LiveCombatFlowWaiter.mapCustom(
                 appContext,
                 new LiveCombatFlowWaiter.Callback() {
                     @Override
@@ -697,7 +701,22 @@ final class GuardedCombatStepper {
                 spec.waitCurrent,
                 spec.lastAction
         );
-        if (!waiter.start()) {
+        WaiterStartOutcome outcome = waiterLifecycle.publishAndStart(new WaiterHandle() {
+            @Override public boolean start() {
+                return waiter.start();
+            }
+
+            @Override public void cancel() {
+                waiter.cancel();
+            }
+        });
+        if (outcome == WaiterStartOutcome.CANCELLED) {
+            finish(
+                    StepOutcome.CANCELLED,
+                    "Guarded stepper: cancelled",
+                    planDetail + "\nbackground wait cancelled before or during publication"
+            );
+        } else if (outcome == WaiterStartOutcome.REJECTED) {
             finish(
                     StepOutcome.BLOCKED,
                     "Guarded stepper: blocked",
@@ -747,6 +766,9 @@ final class GuardedCombatStepper {
     private void handleWaitUpdate(LiveCombatFlowWaiter.Update waitUpdate) {
         String detail = planDetail + "\n" + waitUpdate.detail;
         if (waitUpdate.running) {
+            if (control.cancelled() || waiterLifecycle.cancelled()) {
+                return;
+            }
             post(Update.running("Guarded stepper: waiting " + spec.id, detail));
             return;
         }
@@ -869,6 +891,84 @@ final class GuardedCombatStepper {
         @Override
         public String stopReason() {
             return control.cancelled() ? "phase guard cancelled" : "phase guard timed out";
+        }
+    }
+
+    interface WaiterHandle {
+        boolean start();
+        void cancel();
+    }
+
+    enum WaiterStartOutcome {
+        STARTED,
+        CANCELLED,
+        REJECTED
+    }
+
+    static final class WaiterLifecycle {
+        private WaiterHandle waiter;
+        private boolean cancelled;
+        private boolean cancelDelivered;
+        private boolean startAccepted;
+
+        WaiterStartOutcome publishAndStart(WaiterHandle candidate) {
+            if (candidate == null) {
+                throw new IllegalArgumentException("waiter is required");
+            }
+            boolean cancelBeforeStart;
+            synchronized (this) {
+                if (waiter != null) {
+                    return WaiterStartOutcome.REJECTED;
+                }
+                waiter = candidate;
+                cancelBeforeStart = cancelled;
+                if (cancelBeforeStart) {
+                    cancelDelivered = true;
+                }
+            }
+
+            if (cancelBeforeStart) {
+                candidate.cancel();
+                return WaiterStartOutcome.CANCELLED;
+            }
+
+            boolean accepted = candidate.start();
+            synchronized (this) {
+                startAccepted = accepted;
+                if (cancelled) {
+                    return WaiterStartOutcome.CANCELLED;
+                }
+                return accepted ? WaiterStartOutcome.STARTED : WaiterStartOutcome.REJECTED;
+            }
+        }
+
+        void cancel() {
+            cancelWith(null);
+        }
+
+        void cancelWith(Runnable cancellationBarrier) {
+            WaiterHandle published = null;
+            synchronized (this) {
+                if (cancellationBarrier != null) {
+                    cancellationBarrier.run();
+                }
+                cancelled = true;
+                if (waiter != null && !cancelDelivered) {
+                    cancelDelivered = true;
+                    published = waiter;
+                }
+            }
+            if (published != null) {
+                published.cancel();
+            }
+        }
+
+        synchronized boolean hasActiveWaiter() {
+            return startAccepted && !cancelled;
+        }
+
+        synchronized boolean cancelled() {
+            return cancelled;
         }
     }
 

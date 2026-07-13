@@ -3,6 +3,14 @@ package org.openwsgr.autowsgrmobile;
 import java.io.IOException;
 
 final class AutomationSession {
+    interface Action {
+        boolean run();
+    }
+
+    interface ActionBoundary {
+        boolean perform(Action action);
+    }
+
     interface Sink {
         void append(String line) throws IOException;
         String logPath();
@@ -18,6 +26,8 @@ final class AutomationSession {
     private boolean cancelRequested;
     private String adoptedLogPath = "";
     private String adoptedScreenshotPath = "";
+    private long nestedEvidenceGeneration;
+    private long activeNestedEvidenceGeneration;
 
     AutomationSession(String flowId, String runId, AutomationControl control, Sink sink,
                       AutomationCallback callback) {
@@ -41,21 +51,54 @@ final class AutomationSession {
         ));
     }
 
-    synchronized void adoptEvidence(AutomationUpdate update) {
-        if (finished || update == null) {
-            return;
+    ActionBoundary actionBoundary() {
+        return new ActionBoundary() {
+            @Override public boolean perform(Action action) {
+                return performAction(action);
+            }
+        };
+    }
+
+    boolean performAction(final Action action) {
+        if (action == null) {
+            throw new IllegalArgumentException("action is required");
         }
-        if (update.logPath.length() > 0) {
-            adoptedLogPath = update.logPath;
-        }
-        if (update.screenshotPath.length() > 0) {
-            adoptedScreenshotPath = update.screenshotPath;
+        try {
+            return control.performAction(new AutomationControl.Action() {
+                @Override public boolean run() {
+                    return action.run();
+                }
+            });
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
         }
     }
 
-    synchronized void progressFromNested(AutomationUpdate update, String message, String detail) {
-        adoptEvidence(update);
+    synchronized NestedEvidenceScope beginNestedEvidence(String identity) {
+        long generation = ++nestedEvidenceGeneration;
+        activeNestedEvidenceGeneration = generation;
+        adoptedLogPath = "";
+        adoptedScreenshotPath = "";
+        return new NestedEvidenceScope(generation, identity);
+    }
+
+    synchronized boolean adoptEvidence(NestedEvidenceScope scope, AutomationUpdate update) {
+        if (!isActiveNestedEvidence(scope) || finished || update == null) {
+            return false;
+        }
+        adoptedLogPath = safePath(update.logPath);
+        adoptedScreenshotPath = safePath(update.screenshotPath);
+        return true;
+    }
+
+    synchronized boolean progressFromNested(NestedEvidenceScope scope, AutomationUpdate update,
+                                            String message, String detail) {
+        if (!adoptEvidence(scope, update)) {
+            return false;
+        }
         progress(message, detail);
+        return true;
     }
 
     synchronized boolean finish(AutomationOutcome outcome, String message, String detail,
@@ -153,6 +196,14 @@ final class AutomationSession {
         }
     }
 
+    private boolean isActiveNestedEvidence(NestedEvidenceScope scope) {
+        return scope != null && scope.generation == activeNestedEvidenceGeneration;
+    }
+
+    private static String safePath(String path) {
+        return path == null ? "" : path;
+    }
+
     private static String combinedDetail(String message, String detail) {
         String safeMessage = message == null ? "" : message;
         String safeDetail = detail == null ? "" : detail;
@@ -163,5 +214,15 @@ final class AutomationSession {
             return safeMessage;
         }
         return safeMessage + ", " + safeDetail;
+    }
+
+    static final class NestedEvidenceScope {
+        final long generation;
+        final String identity;
+
+        private NestedEvidenceScope(long generation, String identity) {
+            this.generation = generation;
+            this.identity = identity == null ? "" : identity;
+        }
     }
 }

@@ -148,6 +148,7 @@ final class AutoExpeditionSchedulerRunner {
 
         boolean firstPassCompleted = false;
         long lastAttemptMs = 0L;
+        int passNumber = 0;
         while (!session.cancelled()) {
             if (!session.checkpoint()) {
                 finishCancelled();
@@ -171,10 +172,12 @@ final class AutoExpeditionSchedulerRunner {
 
             lastAttemptMs = SystemClock.elapsedRealtime();
             PassMonitor monitor = new PassMonitor();
+            final AutomationSession.NestedEvidenceScope evidenceScope =
+                    session.beginNestedEvidence("expedition-pass-" + (++passNumber));
             ExpeditionCollectionRunner pass = new ExpeditionCollectionRunner(
                     appContext,
                     config,
-                    passCallback(monitor)
+                    passCallback(monitor, evidenceScope)
             );
             boolean publicationReady = false;
             boolean passStarted = false;
@@ -220,11 +223,14 @@ final class AutoExpeditionSchedulerRunner {
         finishCancelled();
     }
 
-    private AutomationCallback passCallback(final PassMonitor monitor) {
+    private AutomationCallback passCallback(final PassMonitor monitor,
+                                              final AutomationSession.NestedEvidenceScope evidenceScope) {
         return new AutomationCallback() {
             @Override public void onUpdate(AutomationUpdate update) {
                 AutomationUpdate forwarded = forwardedPassUpdate(update, "", "");
-                session.progressFromNested(update, forwarded.message, forwarded.detail);
+                session.progressFromNested(
+                        evidenceScope, update, forwarded.message, forwarded.detail
+                );
                 if (update.outcome.terminal) {
                     monitor.finish(update);
                 }

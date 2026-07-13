@@ -14,10 +14,6 @@ final class MainPageOverlayNavigator {
         boolean cancelled();
     }
 
-    interface ActionBoundary {
-        boolean checkpoint();
-    }
-
     interface TapDispatcher {
         boolean tap(float x, float y);
     }
@@ -67,14 +63,14 @@ final class MainPageOverlayNavigator {
             CancelToken cancel,
             Logger logger
     ) {
-        return dismiss(kind, newsNotShowChecked, cancel, cancelBoundary(cancel), logger);
+        return dismiss(kind, newsNotShowChecked, cancel, directBoundary(cancel), logger);
     }
 
     boolean dismiss(
             MainPageOverlaySignatures.Kind kind,
             boolean newsNotShowChecked,
             CancelToken cancel,
-            ActionBoundary boundary,
+            AutomationSession.ActionBoundary boundary,
             Logger logger
     ) {
         for (TapAction action : dismissTapPlan(kind, newsNotShowChecked)) {
@@ -129,15 +125,15 @@ final class MainPageOverlayNavigator {
         return Collections.unmodifiableList(actions);
     }
 
-    private boolean tapGame(TapAction action, CancelToken cancel, ActionBoundary boundary,
-                            Logger logger) {
+    private boolean tapGame(TapAction action, CancelToken cancel,
+                            AutomationSession.ActionBoundary boundary, Logger logger) {
         float screenX = GameFrameNormalizer.mapGameX(action.gameX);
         float screenY = GameFrameNormalizer.mapGameY(action.gameY);
-        if (!boundary.checkpoint() || cancel.cancelled()) {
-            logger.log("action-boundary-stopped", "before=" + action.name);
-            return false;
-        }
-        boolean tapped = tapDispatcher.tap(screenX, screenY);
+        boolean tapped = boundary.perform(new AutomationSession.Action() {
+            @Override public boolean run() {
+                return tapDispatcher.tap(screenX, screenY);
+            }
+        });
         logger.log(tapped ? "tap" : "tap-failed", "action=" + action.name
                 + ", x=" + screenX + ", y=" + screenY);
         if (!tapped) {
@@ -147,10 +143,10 @@ final class MainPageOverlayNavigator {
         return !cancel.cancelled();
     }
 
-    private static ActionBoundary cancelBoundary(final CancelToken cancel) {
-        return new ActionBoundary() {
-            @Override public boolean checkpoint() {
-                return !cancel.cancelled();
+    private static AutomationSession.ActionBoundary directBoundary(final CancelToken cancel) {
+        return new AutomationSession.ActionBoundary() {
+            @Override public boolean perform(AutomationSession.Action action) {
+                return !cancel.cancelled() && action.run();
             }
         };
     }

@@ -63,6 +63,31 @@ final class CampaignBattleRunner {
         return explicitNoTimesEvidence ? AutomationOutcome.EXHAUSTED : AutomationOutcome.BLOCKED;
     }
 
+    static AutomationOutcome nestedGuardedOutcome(AutomationOutcome outcome) {
+        if (outcome == null) {
+            return AutomationOutcome.BLOCKED;
+        }
+        switch (outcome) {
+            case DOCK_FULL:
+                return AutomationOutcome.DOCK_FULL;
+            case SUCCESS:
+                return AutomationOutcome.SUCCESS;
+            case CANCELLED:
+                return AutomationOutcome.CANCELLED;
+            case FAILED:
+                return AutomationOutcome.FAILED;
+            case BLOCKED:
+                return AutomationOutcome.BLOCKED;
+            case EXHAUSTED:
+                return AutomationOutcome.EXHAUSTED;
+            case NO_ACTION:
+                return AutomationOutcome.NO_ACTION;
+            case RUNNING:
+            default:
+                return AutomationOutcome.RUNNING;
+        }
+    }
+
     synchronized boolean start() {
         OneShotStartGate.Decision decision = startGate.claim(session.cancelled());
         if (decision == OneShotStartGate.Decision.REJECTED) {
@@ -217,7 +242,7 @@ final class CampaignBattleRunner {
                 return null;
             }
             if (!battleNavigator.tapStartScreenEnter(
-                    cancelToken(), session::checkpoint, navigatorLogger())) {
+                    cancelToken(), session.actionBoundary(), navigatorLogger())) {
                 finishBlockedOrCancelled("tap-start-screen-enter-failed");
                 return null;
             }
@@ -233,7 +258,7 @@ final class CampaignBattleRunner {
             return;
         }
         if (!battleNavigator.tapHomeMap(
-                home, cancelToken(), session::checkpoint, navigatorLogger())) {
+                home, cancelToken(), session.actionBoundary(), navigatorLogger())) {
             finishBlockedOrCancelled("tap-home-map-failed");
             return;
         }
@@ -281,7 +306,8 @@ final class CampaignBattleRunner {
                 finishCancelled();
                 return;
             }
-            if (!campaignNavigator.tapBattlePanel(campaignCancelToken(), campaignLogger())) {
+            if (!campaignNavigator.tapBattlePanel(
+                    campaignCancelToken(), session.actionBoundary(), campaignLogger())) {
                 finishBlockedOrCancelled("tap-battle-panel-failed");
                 return;
             }
@@ -292,7 +318,9 @@ final class CampaignBattleRunner {
                 finishCancelled();
                 return;
             }
-            if (!campaignNavigator.tapCampaign(target.mapIndex, campaignCancelToken(), campaignLogger())) {
+            if (!campaignNavigator.tapCampaign(
+                    target.mapIndex, campaignCancelToken(), session.actionBoundary(),
+                    campaignLogger())) {
                 finishBlockedOrCancelled("tap-campaign-" + target.mapIndex + "-failed");
                 return;
             }
@@ -360,7 +388,8 @@ final class CampaignBattleRunner {
             finishCancelled();
             return false;
         }
-        if (!campaignNavigator.tapDifficultyToggle(campaignCancelToken(), campaignLogger())) {
+        if (!campaignNavigator.tapDifficultyToggle(
+                campaignCancelToken(), session.actionBoundary(), campaignLogger())) {
             finishBlockedOrCancelled("tap-difficulty-toggle-failed");
             return false;
         }
@@ -433,7 +462,8 @@ final class CampaignBattleRunner {
             finishCancelled();
             return false;
         }
-        if (!campaignNavigator.tapQuickRepairPanel(campaignCancelToken(), campaignLogger())) {
+        if (!campaignNavigator.tapQuickRepairPanel(
+                campaignCancelToken(), session.actionBoundary(), campaignLogger())) {
             if (session.cancelled()) {
                 finishCancelled();
                 return false;
@@ -448,7 +478,8 @@ final class CampaignBattleRunner {
                 return false;
             }
             if (states[i] >= threshold && states[i] <= ShipDamagePolicy.SEVERE) {
-                campaignNavigator.tapRepairSlot(i, campaignCancelToken(), campaignLogger());
+                campaignNavigator.tapRepairSlot(
+                        i, campaignCancelToken(), session.actionBoundary(), campaignLogger());
             }
         }
         if (session.cancelled()) {
@@ -491,7 +522,8 @@ final class CampaignBattleRunner {
         if (!session.checkpoint()) {
             return BattleResult.cancelled();
         }
-        if (!battleNavigator.tapStartBattle(cancelToken(), session::checkpoint, navigatorLogger())) {
+        if (!battleNavigator.tapStartBattle(
+                cancelToken(), session.actionBoundary(), navigatorLogger())) {
             return session.cancelled() ? BattleResult.cancelled() : BattleResult.blocked("tap-start-sortie-failed");
         }
         // 出征后短窗口内未进入敌方预览 → 战役次数用尽（仿原版 wait_leave_page 失败）。
@@ -512,7 +544,7 @@ final class CampaignBattleRunner {
             return BattleResult.cancelled();
         }
         if (!battleNavigator.tapEnemyStartBattle(
-                cancelToken(), session::checkpoint, navigatorLogger())) {
+                cancelToken(), session.actionBoundary(), navigatorLogger())) {
             return session.cancelled() ? BattleResult.cancelled() : BattleResult.blocked("tap-enemy-start-battle-failed");
         }
         // 阵型选择 → 默认阵型
@@ -523,7 +555,7 @@ final class CampaignBattleRunner {
             return BattleResult.cancelled();
         }
         if (!battleNavigator.tapDefaultFormation(
-                cancelToken(), session::checkpoint, navigatorLogger())) {
+                cancelToken(), session.actionBoundary(), navigatorLogger())) {
             return session.cancelled() ? BattleResult.cancelled() : BattleResult.blocked("tap-default-formation-failed");
         }
         return waitForCombatOrNightPromptCompletion(battle);
@@ -554,7 +586,7 @@ final class CampaignBattleRunner {
                     return BattleResult.cancelled();
                 }
                 if (!battleNavigator.tapNightPrompt(
-                        pursue, cancelToken(), session::checkpoint, navigatorLogger())) {
+                        pursue, cancelToken(), session.actionBoundary(), navigatorLogger())) {
                     return session.cancelled() ? BattleResult.cancelled()
                             : BattleResult.blocked("tap-night-prompt-" + actionId + "-failed");
                 }
@@ -602,7 +634,7 @@ final class CampaignBattleRunner {
             }
             progress("战役：战斗批次结束", "battle=" + battle + ", batch=" + batch
                     + ", outcome=" + finalUpdate.outcome + ", message=" + finalUpdate.message);
-            switch (finalUpdate.outcome) {
+            switch (nestedGuardedOutcome(finalUpdate.outcome)) {
                 case SUCCESS:
                     return BattleResult.success(finalUpdate.message + ", " + finalUpdate.detail);
                 case CANCELLED:
@@ -630,13 +662,15 @@ final class CampaignBattleRunner {
 
     private AutomationUpdate runGuardedBatch(final int battle, final int batch) {
         final GuardedResult guardedResult = new GuardedResult();
+        final AutomationSession.NestedEvidenceScope evidenceScope =
+                session.beginNestedEvidence("campaign-" + battle + "-guarded-batch-" + batch);
         GuardedCombatRunner runner = GuardedCombatRunner.boundedLoopExecuteGuarded(
                 appContext,
                 policy,
                 new AutomationCallback() {
                     @Override
                     public void onUpdate(AutomationUpdate update) {
-                        session.progressFromNested(update, "战役：战斗中",
+                        session.progressFromNested(evidenceScope, update, "战役：战斗中",
                                 "battle=" + battle + ", batch=" + batch
                                 + ", outcome=" + update.outcome
                                 + ", message=" + update.message
