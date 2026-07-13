@@ -276,6 +276,111 @@ public final class Task5RunnerSafetyTest {
                 lifecycle.hasActiveWaiter());
     }
 
+    @Test public void cancellationBeforeGestureRunningEnqueueRejectsPublication() {
+        GuardedCombatStepper.PublicationGate gate =
+                new GuardedCombatStepper.PublicationGate();
+        AtomicInteger gestures = new AtomicInteger(1);
+        AtomicInteger enqueues = new AtomicInteger();
+
+        gate.cancel();
+        GuardedCombatStepper.PublicationResult result = gate.publishRunning(() -> {
+            enqueues.incrementAndGet();
+            return true;
+        });
+
+        assertEquals("the already-admitted gesture is not erased", 1, gestures.get());
+        assertEquals(GuardedCombatStepper.PublicationResult.REJECTED, result);
+        assertEquals("cancel-first must suppress gesture-dispatched RUNNING", 0,
+                enqueues.get());
+    }
+
+    @Test public void runningEnqueueFirstMakesCancelWaitThenRejectsLaterRunning()
+            throws Exception {
+        GuardedCombatStepper.PublicationGate gate =
+                new GuardedCombatStepper.PublicationGate();
+        CountDownLatch enqueueEntered = new CountDownLatch(1);
+        CountDownLatch releaseEnqueue = new CountDownLatch(1);
+        AtomicInteger enqueues = new AtomicInteger();
+        AtomicReference<GuardedCombatStepper.PublicationResult> first =
+                new AtomicReference<>();
+        Thread publish = new Thread(() -> first.set(gate.publishRunning(() -> {
+            enqueues.incrementAndGet();
+            enqueueEntered.countDown();
+            awaitUninterruptibly(releaseEnqueue);
+            return true;
+        })), "stepper-running-enqueue-first");
+        publish.start();
+        assertTrue(enqueueEntered.await(1, TimeUnit.SECONDS));
+
+        Thread cancel = new Thread(gate::cancel, "stepper-publication-cancel");
+        cancel.start();
+        boolean blocked = awaitThreadState(cancel, Thread.State.BLOCKED, 1000L);
+        if (!blocked) {
+            releaseEnqueue.countDown();
+        }
+        assertTrue("cancel must linearize after the in-gate enqueue action", blocked);
+
+        releaseEnqueue.countDown();
+        publish.join(1000L);
+        cancel.join(1000L);
+        assertFalse(publish.isAlive());
+        assertFalse(cancel.isAlive());
+        assertEquals(GuardedCombatStepper.PublicationResult.ENQUEUED, first.get());
+        assertEquals(1, enqueues.get());
+        assertEquals(
+                GuardedCombatStepper.PublicationResult.REJECTED,
+                gate.publishRunning(() -> { enqueues.incrementAndGet(); return true; })
+        );
+        assertEquals(1, enqueues.get());
+    }
+
+    @Test public void cancellationBetweenWaiterObservationAndPublicationRejectsRunning()
+            throws Exception {
+        GuardedCombatStepper.PublicationGate gate =
+                new GuardedCombatStepper.PublicationGate();
+        CountDownLatch waiterStateObserved = new CountDownLatch(1);
+        CountDownLatch allowPublication = new CountDownLatch(1);
+        AtomicInteger enqueues = new AtomicInteger();
+        AtomicReference<GuardedCombatStepper.PublicationResult> result =
+                new AtomicReference<>();
+        Thread waiterCallback = new Thread(() -> {
+            assertFalse(gate.cancelled());
+            waiterStateObserved.countDown();
+            awaitUninterruptibly(allowPublication);
+            result.set(gate.publishRunning(() -> {
+                enqueues.incrementAndGet();
+                return true;
+            }));
+        }, "waiter-running-publication-race");
+        waiterCallback.start();
+        assertTrue(waiterStateObserved.await(1, TimeUnit.SECONDS));
+
+        gate.cancel();
+        allowPublication.countDown();
+        waiterCallback.join(1000L);
+
+        assertFalse(waiterCallback.isAlive());
+        assertEquals(GuardedCombatStepper.PublicationResult.REJECTED, result.get());
+        assertEquals(0, enqueues.get());
+    }
+
+    @Test public void terminalPublicationRemainsAvailableExactlyOnceAfterCancellation() {
+        GuardedCombatStepper.PublicationGate gate =
+                new GuardedCombatStepper.PublicationGate();
+        AtomicInteger terminals = new AtomicInteger();
+        gate.cancel();
+
+        assertEquals(
+                GuardedCombatStepper.PublicationResult.ENQUEUED,
+                gate.publishTerminal(() -> { terminals.incrementAndGet(); return true; })
+        );
+        assertEquals(
+                GuardedCombatStepper.PublicationResult.REJECTED,
+                gate.publishTerminal(() -> { terminals.incrementAndGet(); return true; })
+        );
+        assertEquals(1, terminals.get());
+    }
+
     @Test public void stoppedGuardedChildWithoutTerminalFailsClosedWithoutHang() {
         AutomationSession session = new AutomationSession(
                 "guarded", "parent", new AutomationControl(), new EmptySink(), update -> { }
