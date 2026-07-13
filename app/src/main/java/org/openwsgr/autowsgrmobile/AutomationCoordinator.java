@@ -1,9 +1,7 @@
 package org.openwsgr.autowsgrmobile;
 
 final class AutomationCoordinator {
-    private AutomationFlow activeFlow;
-    private String activeId = "";
-    private String activeLabel = "";
+    private Reservation active;
 
     StartResult start(AutomationFlow flow) {
         if (flow == null) {
@@ -12,50 +10,46 @@ final class AutomationCoordinator {
             }
         }
 
-        String flowId = safe(flow.id());
-        String flowLabel = safe(flow.label());
+        Reservation reservation = new Reservation(flow, safe(flow.id()), safe(flow.label()));
         synchronized (this) {
-            if (activeFlow != null) {
+            if (active != null) {
                 return rejected("another flow is active");
             }
-            activeFlow = flow;
-            activeId = flowId;
-            activeLabel = flowLabel;
+            active = reservation;
         }
 
         final boolean started;
         try {
             started = flow.start();
         } catch (RuntimeException | Error failure) {
-            clearReservation(flow);
+            clearReservation(reservation);
             throw failure;
         }
         if (!started) {
-            clearReservation(flow);
+            clearReservation(reservation);
             synchronized (this) {
                 return rejected("flow did not start");
             }
         }
-        return new StartResult(true, flowId, flowLabel, "");
+        return new StartResult(true, reservation.id, reservation.label, "");
     }
 
     synchronized boolean finish(String flowId) {
-        if (activeFlow == null || !activeId.equals(safe(flowId))) {
+        if (active == null || !active.id.equals(safe(flowId))) {
             return false;
         }
-        activeFlow = null;
-        activeId = "";
-        activeLabel = "";
+        active = null;
         return true;
     }
 
     boolean cancelActive() {
         AutomationFlow flow;
         synchronized (this) {
-            flow = activeFlow;
-        }
-        if (flow == null) {
-            return false;
+            if (active == null || active.cancelRequested) {
+                return false;
+            }
+            active.cancelRequested = true;
+            flow = active.flow;
         }
         flow.cancel();
         return true;
@@ -64,7 +58,7 @@ final class AutomationCoordinator {
     boolean pauseActive() {
         AutomationFlow flow;
         synchronized (this) {
-            flow = activeFlow;
+            flow = active == null ? null : active.flow;
         }
         if (flow == null || !flow.supportsPause()) {
             return false;
@@ -76,7 +70,7 @@ final class AutomationCoordinator {
     boolean resumeActive() {
         AutomationFlow flow;
         synchronized (this) {
-            flow = activeFlow;
+            flow = active == null ? null : active.flow;
         }
         if (flow == null || !flow.supportsPause()) {
             return false;
@@ -86,31 +80,47 @@ final class AutomationCoordinator {
     }
 
     synchronized boolean hasActiveFlow() {
-        return activeFlow != null;
+        return active != null;
     }
 
     synchronized String activeId() {
-        return activeId;
+        return active == null ? "" : active.id;
     }
 
     synchronized String activeLabel() {
-        return activeLabel;
+        return active == null ? "" : active.label;
     }
 
-    private synchronized void clearReservation(AutomationFlow flow) {
-        if (activeFlow == flow) {
-            activeFlow = null;
-            activeId = "";
-            activeLabel = "";
+    private synchronized void clearReservation(Reservation reservation) {
+        if (active == reservation) {
+            active = null;
         }
     }
 
     private StartResult rejected(String reason) {
-        return new StartResult(false, activeId, activeLabel, reason);
+        return new StartResult(
+                false,
+                active == null ? "" : active.id,
+                active == null ? "" : active.label,
+                reason
+        );
     }
 
     private static String safe(String value) {
         return value == null ? "" : value;
+    }
+
+    private static final class Reservation {
+        final AutomationFlow flow;
+        final String id;
+        final String label;
+        boolean cancelRequested;
+
+        Reservation(AutomationFlow flow, String id, String label) {
+            this.flow = flow;
+            this.id = id;
+            this.label = label;
+        }
     }
 
     static final class StartResult {

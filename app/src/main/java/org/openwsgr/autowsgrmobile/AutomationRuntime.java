@@ -8,18 +8,31 @@ final class AutomationRuntime implements AutomationCallback {
         void onAutomationUpdate(AutomationUpdate update);
     }
 
+    interface StateBoundary {
+        void afterTerminalRelease(AutomationUpdate update);
+    }
+
     private final Object listenerLock = new Object();
     private final CallbackDispatcher dispatcher;
+    private final StateBoundary stateBoundary;
     private final AutomationCoordinator coordinator = new AutomationCoordinator();
     private final List<Registration> listeners = new ArrayList<>();
     private AutomationUpdate latestUpdate;
     private long updateSequence;
 
     AutomationRuntime(CallbackDispatcher dispatcher) {
-        if (dispatcher == null) {
-            throw new IllegalArgumentException("dispatcher is required");
+        this(dispatcher, new StateBoundary() {
+            @Override public void afterTerminalRelease(AutomationUpdate update) {
+            }
+        });
+    }
+
+    AutomationRuntime(CallbackDispatcher dispatcher, StateBoundary stateBoundary) {
+        if (dispatcher == null || stateBoundary == null) {
+            throw new IllegalArgumentException("dispatcher and state boundary are required");
         }
         this.dispatcher = dispatcher;
+        this.stateBoundary = stateBoundary;
     }
 
     AutomationCoordinator.StartResult start(AutomationFlow flow) {
@@ -82,13 +95,12 @@ final class AutomationRuntime implements AutomationCallback {
         if (update == null) {
             return;
         }
-        if (update.outcome.terminal) {
-            coordinator.finish(update.flowId);
-        }
-
         List<Registration> snapshot;
         long sequence;
         synchronized (listenerLock) {
+            if (update.outcome.terminal && coordinator.finish(update.flowId)) {
+                stateBoundary.afterTerminalRelease(update);
+            }
             latestUpdate = update;
             sequence = ++updateSequence;
             snapshot = new ArrayList<>(listeners);
