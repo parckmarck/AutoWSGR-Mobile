@@ -3,9 +3,7 @@ package org.openwsgr.autowsgrmobile;
 import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
-import java.nio.file.StandardCopyOption;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -131,7 +129,7 @@ final class ConfigProfileRepository {
         if (target.exists()) {
             throw new IOException("profile already exists: " + newId);
         }
-        moveWithoutReplacing(profile.file, target);
+        AtomicTextFile.moveWithoutReplacing(profile.file, target);
         if (id.equals(activeStore.load())) {
             activeStore.save(newId);
         }
@@ -218,14 +216,6 @@ final class ConfigProfileRepository {
     private void rejectBuiltIn(String id) throws IOException {
         if (BUILTIN_ID.equals(id)) {
             throw new IOException("built-in profile is read-only");
-        }
-    }
-
-    private void moveWithoutReplacing(File source, File target) throws IOException {
-        try {
-            Files.move(source.toPath(), target.toPath(), StandardCopyOption.ATOMIC_MOVE);
-        } catch (AtomicMoveNotSupportedException ignored) {
-            Files.move(source.toPath(), target.toPath());
         }
     }
 

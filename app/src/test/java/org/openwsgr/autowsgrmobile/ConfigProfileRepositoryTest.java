@@ -90,6 +90,30 @@ public final class ConfigProfileRepositoryTest {
                 new String(Files.readAllBytes(target.toPath()), StandardCharsets.UTF_8));
     }
 
+    @Test public void renameMoveBoundaryPreservesDestinationCreatedAfterInitialCheck() throws Exception {
+        File dir = temporaryFolder.newFolder("rename-no-replace-race");
+        ConfigProfileRepository repo = repository(dir);
+        ConfigProfile source = repo.saveAs("source", "automation:\n  source: true\n", false, false);
+        File destination = new File(dir, "destination.yaml");
+        assertFalse(destination.exists());
+
+        byte[] sourceBytes = Files.readAllBytes(source.file.toPath());
+        byte[] destinationBytes = "automation:\n  destination: true\n"
+                .getBytes(StandardCharsets.UTF_8);
+        Files.write(destination.toPath(), destinationBytes);
+
+        boolean moveFailed = false;
+        try {
+            AtomicTextFile.moveWithoutReplacing(source.file, destination);
+        } catch (IOException expected) {
+            moveFailed = true;
+        }
+
+        assertArrayEquals(destinationBytes, Files.readAllBytes(destination.toPath()));
+        assertArrayEquals(sourceBytes, Files.readAllBytes(source.file.toPath()));
+        assertTrue("the final no-replace move must fail", moveFailed);
+    }
+
     @Test public void builtinCannotBeOverwrittenRenamedOrDeleted() throws Exception {
         ConfigProfileRepository repo = repository(temporaryFolder.newFolder("readonly"));
         assertThrows(IOException.class, () -> repo.save("builtin-safe", "automation:\n"));
