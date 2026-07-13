@@ -12,6 +12,7 @@ final class AutoExpeditionSchedulerRunner {
     private final Context appContext;
     private final AutoExpeditionConfig config;
     private final AutomationSession session;
+    private final OneShotStartGate startGate = new OneShotStartGate();
 
     private Thread worker;
     private volatile ExpeditionCollectionRunner activePass;
@@ -63,13 +64,24 @@ final class AutoExpeditionSchedulerRunner {
                 + ", pass_message=" + update.message
                 + ", pass_detail=" + update.detail;
         return AutomationUpdate.progress(
-                "expedition", schedulerRunId, message, detail, schedulerLogPath, ""
+                "expedition",
+                schedulerRunId,
+                message,
+                detail,
+                update != null && update.logPath.length() > 0
+                        ? update.logPath : schedulerLogPath,
+                update == null ? "" : update.screenshotPath
         );
     }
 
     synchronized boolean start() {
-        if (running) {
+        OneShotStartGate.Decision decision = startGate.claim(session.cancelled());
+        if (decision == OneShotStartGate.Decision.REJECTED) {
             return false;
+        }
+        if (decision == OneShotStartGate.Decision.PRE_CANCELLED) {
+            finishCancelled();
+            return true;
         }
         running = true;
         worker = new Thread(new Runnable() {
@@ -92,21 +104,22 @@ final class AutoExpeditionSchedulerRunner {
     }
 
     void cancel() {
-        session.cancel();
-        ExpeditionCollectionRunner pass = activePass;
-        if (pass != null) {
-            pass.cancel();
-        }
+        ExpeditionCollectionRunner pass;
         Thread thread;
         synchronized (this) {
+            session.cancel();
+            pass = activePass;
             thread = worker;
+        }
+        if (pass != null) {
+            pass.cancel();
         }
         if (thread != null) {
             thread.interrupt();
         }
     }
 
-    void pause() {
+    synchronized void pause() {
         session.pause();
         ExpeditionCollectionRunner pass = activePass;
         if (pass != null) {
@@ -114,7 +127,7 @@ final class AutoExpeditionSchedulerRunner {
         }
     }
 
-    void resume() {
+    synchronized void resume() {
         session.resume();
         ExpeditionCollectionRunner pass = activePass;
         if (pass != null) {
@@ -163,14 +176,29 @@ final class AutoExpeditionSchedulerRunner {
                     config,
                     passCallback(monitor)
             );
-            activePass = pass;
-            if (!session.checkpoint()) {
-                activePass = null;
-                finishCancelled();
-                return;
+            boolean publicationReady = false;
+            boolean passStarted = false;
+            while (!publicationReady) {
+                if (!session.checkpoint()) {
+                    finishCancelled();
+                    return;
+                }
+                synchronized (this) {
+                    if (session.cancelled()) {
+                        finishCancelled();
+                        return;
+                    }
+                    if (!session.paused()) {
+                        activePass = pass;
+                        passStarted = pass.start();
+                        if (!passStarted) {
+                            activePass = null;
+                        }
+                        publicationReady = true;
+                    }
+                }
             }
-            if (!pass.start()) {
-                activePass = null;
+            if (!passStarted) {
                 sleepForWait(WAIT_CHUNK_MS, "pass-start-skipped");
                 continue;
             }
@@ -196,7 +224,7 @@ final class AutoExpeditionSchedulerRunner {
         return new AutomationCallback() {
             @Override public void onUpdate(AutomationUpdate update) {
                 AutomationUpdate forwarded = forwardedPassUpdate(update, "", "");
-                progress(forwarded.message, forwarded.detail);
+                session.progressFromNested(update, forwarded.message, forwarded.detail);
                 if (update.outcome.terminal) {
                     monitor.finish(update);
                 }

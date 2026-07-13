@@ -15,6 +15,9 @@ final class AutomationSession {
     private final Sink sink;
     private final AutomationCallback callback;
     private boolean finished;
+    private boolean cancelRequested;
+    private String adoptedLogPath = "";
+    private String adoptedScreenshotPath = "";
 
     AutomationSession(String flowId, String runId, AutomationControl control, Sink sink,
                       AutomationCallback callback) {
@@ -29,13 +32,30 @@ final class AutomationSession {
     }
 
     synchronized void progress(String message, String detail) {
-        if (finished) {
+        if (finished || cancelRequested) {
             return;
         }
         append(AutomationOutcome.RUNNING, message, detail);
         callback.onUpdate(AutomationUpdate.progress(
-                flowId, runId, message, detail, safeLogPath(), ""
+                flowId, runId, message, detail, effectiveLogPath(), adoptedScreenshotPath
         ));
+    }
+
+    synchronized void adoptEvidence(AutomationUpdate update) {
+        if (finished || update == null) {
+            return;
+        }
+        if (update.logPath.length() > 0) {
+            adoptedLogPath = update.logPath;
+        }
+        if (update.screenshotPath.length() > 0) {
+            adoptedScreenshotPath = update.screenshotPath;
+        }
+    }
+
+    synchronized void progressFromNested(AutomationUpdate update, String message, String detail) {
+        adoptEvidence(update);
+        progress(message, detail);
     }
 
     synchronized boolean finish(AutomationOutcome outcome, String message, String detail,
@@ -48,9 +68,24 @@ final class AutomationSession {
         }
         finished = true;
 
-        append(outcome, message, detail);
-        String screenshotPath = "";
-        if (saveFailure) {
+        AutomationOutcome publishedOutcome = cancelRequested
+                ? AutomationOutcome.CANCELLED : outcome;
+        String publishedMessage = message;
+        String publishedDetail = detail;
+        boolean captureFailure = saveFailure;
+        if (cancelRequested && outcome != AutomationOutcome.CANCELLED) {
+            publishedMessage = "自动化：已停止";
+            publishedDetail = "cancelled before terminal; discarded_outcome=" + outcome
+                    + (detail == null || detail.length() == 0 ? "" : ", detail=" + detail);
+            captureFailure = false;
+        }
+        if (publishedOutcome == AutomationOutcome.CANCELLED) {
+            captureFailure = false;
+        }
+
+        append(publishedOutcome, publishedMessage, publishedDetail);
+        String screenshotPath = adoptedScreenshotPath;
+        if (captureFailure && screenshotPath.length() == 0) {
             try {
                 String saved = sink.saveFailure(runId);
                 screenshotPath = saved == null ? "" : saved;
@@ -59,7 +94,8 @@ final class AutomationSession {
             }
         }
         callback.onUpdate(AutomationUpdate.terminal(
-                flowId, runId, outcome, message, detail, safeLogPath(), screenshotPath
+                flowId, runId, publishedOutcome, publishedMessage, publishedDetail,
+                effectiveLogPath(), screenshotPath
         ));
         return true;
     }
@@ -72,7 +108,10 @@ final class AutomationSession {
         control.resume();
     }
 
-    void cancel() {
+    synchronized void cancel() {
+        if (!finished) {
+            cancelRequested = true;
+        }
         control.cancel();
     }
 
@@ -89,6 +128,10 @@ final class AutomationSession {
         return control.cancelled();
     }
 
+    boolean paused() {
+        return control.paused();
+    }
+
     private void append(AutomationOutcome outcome, String message, String detail) {
         try {
             sink.append(MinimumRunLogStore.line(
@@ -98,7 +141,10 @@ final class AutomationSession {
         }
     }
 
-    private String safeLogPath() {
+    private String effectiveLogPath() {
+        if (adoptedLogPath.length() > 0) {
+            return adoptedLogPath;
+        }
         try {
             String path = sink.logPath();
             return path == null ? "" : path;

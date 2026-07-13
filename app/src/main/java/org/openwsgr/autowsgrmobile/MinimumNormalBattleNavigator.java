@@ -32,8 +32,43 @@ final class MinimumNormalBattleNavigator {
         boolean cancelled();
     }
 
+    interface ActionBoundary {
+        boolean checkpoint();
+    }
+
+    interface TapDispatcher {
+        boolean tap(float x, float y);
+    }
+
+    interface Delay {
+        void sleep(long delayMs);
+    }
+
     interface Logger {
         void log(String status, String detail);
+    }
+
+    private final TapDispatcher tapDispatcher;
+    private final Delay delay;
+
+    MinimumNormalBattleNavigator() {
+        this(new TapDispatcher() {
+            @Override public boolean tap(float x, float y) {
+                return AndroidControllerBridge.tap(x, y);
+            }
+        }, new Delay() {
+            @Override public void sleep(long delayMs) {
+                SystemClock.sleep(delayMs);
+            }
+        });
+    }
+
+    MinimumNormalBattleNavigator(TapDispatcher tapDispatcher, Delay delay) {
+        if (tapDispatcher == null || delay == null) {
+            throw new IllegalArgumentException("tapDispatcher and delay are required");
+        }
+        this.tapDispatcher = tapDispatcher;
+        this.delay = delay;
     }
 
     static List<TapAction> tapPlanForTarget(NormalSortieTarget target) {
@@ -70,8 +105,13 @@ final class MinimumNormalBattleNavigator {
     }
 
     boolean navigateToTarget(NormalSortieTarget target, CancelToken cancel, Logger logger) {
+        return navigateToTarget(target, cancel, cancelBoundary(cancel), logger);
+    }
+
+    boolean navigateToTarget(NormalSortieTarget target, CancelToken cancel,
+                             ActionBoundary boundary, Logger logger) {
         for (TapAction action : tapPlanForTarget(target)) {
-            if (!tapGame(action.name, action.gameX, action.gameY, cancel, logger)) {
+            if (!tapGame(action.name, action.gameX, action.gameY, cancel, boundary, logger)) {
                 return false;
             }
         }
@@ -79,12 +119,21 @@ final class MinimumNormalBattleNavigator {
     }
 
     boolean tapHomeMap(MinimumGameStateRecognizer.Result state, CancelToken cancel, Logger logger) {
-        return tapGame("home-map", state.homeMapTapX, state.homeMapTapY, cancel, logger);
+        return tapHomeMap(state, cancel, cancelBoundary(cancel), logger);
+    }
+
+    boolean tapHomeMap(MinimumGameStateRecognizer.Result state, CancelToken cancel,
+                       ActionBoundary boundary, Logger logger) {
+        return tapGame("home-map", state.homeMapTapX, state.homeMapTapY, cancel, boundary, logger);
     }
 
     boolean tapStartScreenEnter(CancelToken cancel, Logger logger) {
+        return tapStartScreenEnter(cancel, cancelBoundary(cancel), logger);
+    }
+
+    boolean tapStartScreenEnter(CancelToken cancel, ActionBoundary boundary, Logger logger) {
         for (TapAction action : startScreenEnterPlan()) {
-            if (!tapGame(action.name, action.gameX, action.gameY, cancel, logger)) {
+            if (!tapGame(action.name, action.gameX, action.gameY, cancel, boundary, logger)) {
                 return false;
             }
         }
@@ -92,16 +141,31 @@ final class MinimumNormalBattleNavigator {
     }
 
     boolean tapMapSortiePanel(CancelToken cancel, Logger logger) {
-        return tapGame("map-sortie-panel", MAP_SORTIE_PANEL_X, MAP_SORTIE_PANEL_Y, cancel, logger);
+        return tapMapSortiePanel(cancel, cancelBoundary(cancel), logger);
+    }
+
+    boolean tapMapSortiePanel(CancelToken cancel, ActionBoundary boundary, Logger logger) {
+        return tapGame("map-sortie-panel", MAP_SORTIE_PANEL_X, MAP_SORTIE_PANEL_Y,
+                cancel, boundary, logger);
     }
 
     boolean tapEnterSortie(CancelToken cancel, Logger logger) {
-        return tapGame("enter-sortie-1-1", ENTER_SORTIE_X, ENTER_SORTIE_Y, cancel, logger);
+        return tapEnterSortie(cancel, cancelBoundary(cancel), logger);
+    }
+
+    boolean tapEnterSortie(CancelToken cancel, ActionBoundary boundary, Logger logger) {
+        return tapGame("enter-sortie-1-1", ENTER_SORTIE_X, ENTER_SORTIE_Y,
+                cancel, boundary, logger);
     }
 
     boolean tapEnterSortie(NormalSortieTarget target, CancelToken cancel, Logger logger) {
+        return tapEnterSortie(target, cancel, cancelBoundary(cancel), logger);
+    }
+
+    boolean tapEnterSortie(NormalSortieTarget target, CancelToken cancel,
+                           ActionBoundary boundary, Logger logger) {
         for (TapAction action : enterSelectedMapPlan(target)) {
-            if (!tapGame(action.name, action.gameX, action.gameY, cancel, logger)) {
+            if (!tapGame(action.name, action.gameX, action.gameY, cancel, boundary, logger)) {
                 return false;
             }
         }
@@ -109,71 +173,111 @@ final class MinimumNormalBattleNavigator {
     }
 
     boolean tapMapStartNode(CancelToken cancel, Logger logger) {
-        return tapGame("map-start-node", MAP_START_NODE_X, MAP_START_NODE_Y, cancel, logger);
+        return tapMapStartNode(cancel, cancelBoundary(cancel), logger);
+    }
+
+    boolean tapMapStartNode(CancelToken cancel, ActionBoundary boundary, Logger logger) {
+        return tapGame("map-start-node", MAP_START_NODE_X, MAP_START_NODE_Y,
+                cancel, boundary, logger);
     }
 
     boolean tapFleetOne(CancelToken cancel, Logger logger) {
-        return tapGame("fleet-1", FLEET_1_X, FLEET_1_Y, cancel, logger);
+        return tapFleetOne(cancel, cancelBoundary(cancel), logger);
+    }
+
+    boolean tapFleetOne(CancelToken cancel, ActionBoundary boundary, Logger logger) {
+        return tapGame("fleet-1", FLEET_1_X, FLEET_1_Y, cancel, boundary, logger);
     }
 
     boolean tapStartBattle(CancelToken cancel, Logger logger) {
+        return tapStartBattle(cancel, cancelBoundary(cancel), logger);
+    }
+
+    boolean tapStartBattle(CancelToken cancel, ActionBoundary boundary, Logger logger) {
         return tapGame(
                 "start-sortie",
                 MinimumBattleTapTargets.START_BATTLE_X,
                 MinimumBattleTapTargets.START_BATTLE_Y,
                 cancel,
+                boundary,
                 logger
         );
     }
 
     boolean tapEnemyStartBattle(CancelToken cancel, Logger logger) {
+        return tapEnemyStartBattle(cancel, cancelBoundary(cancel), logger);
+    }
+
+    boolean tapEnemyStartBattle(CancelToken cancel, ActionBoundary boundary, Logger logger) {
         return tapGame(
                 "enemy-start-battle",
                 MinimumBattleTapTargets.ENEMY_START_BATTLE_X,
                 MinimumBattleTapTargets.ENEMY_START_BATTLE_Y,
                 cancel,
+                boundary,
                 logger
         );
     }
 
     boolean tapDefaultFormation(CancelToken cancel, Logger logger) {
+        return tapDefaultFormation(cancel, cancelBoundary(cancel), logger);
+    }
+
+    boolean tapDefaultFormation(CancelToken cancel, ActionBoundary boundary, Logger logger) {
         return tapGame(
                 "default-formation",
                 MinimumBattleTapTargets.DEFAULT_FORMATION_X,
                 MinimumBattleTapTargets.DEFAULT_FORMATION_Y,
                 cancel,
+                boundary,
                 logger
         );
     }
 
     boolean tapNightPrompt(boolean pursue, CancelToken cancel, Logger logger) {
+        return tapNightPrompt(pursue, cancel, cancelBoundary(cancel), logger);
+    }
+
+    boolean tapNightPrompt(boolean pursue, CancelToken cancel, ActionBoundary boundary,
+                           Logger logger) {
         return tapGame(
                 pursue ? "night-pursue" : "night-abandon",
                 pursue ? MinimumBattleTapTargets.NIGHT_YES_X : MinimumBattleTapTargets.NIGHT_NO_X,
                 pursue ? MinimumBattleTapTargets.NIGHT_YES_Y : MinimumBattleTapTargets.NIGHT_NO_Y,
                 cancel,
+                boundary,
                 logger
         );
     }
 
-    private boolean tapGame(String name, float gameX, float gameY, CancelToken cancel, Logger logger) {
+    private boolean tapGame(String name, float gameX, float gameY, CancelToken cancel,
+                            ActionBoundary boundary, Logger logger) {
         float screenX = GameFrameNormalizer.mapGameX(gameX);
         float screenY = GameFrameNormalizer.mapGameY(gameY);
-        return tapScreen(name, screenX, screenY, cancel, logger);
+        return tapScreen(name, screenX, screenY, cancel, boundary, logger);
     }
 
-    private boolean tapScreen(String name, float x, float y, CancelToken cancel, Logger logger) {
-        if (cancel.cancelled()) {
-            logger.log("cancelled", "before=" + name);
+    private boolean tapScreen(String name, float x, float y, CancelToken cancel,
+                              ActionBoundary boundary, Logger logger) {
+        if (!boundary.checkpoint() || cancel.cancelled()) {
+            logger.log("action-boundary-stopped", "before=" + name);
             return false;
         }
-        boolean tapped = AndroidControllerBridge.tap(x, y);
+        boolean tapped = tapDispatcher.tap(x, y);
         logger.log(tapped ? "tap" : "tap-failed", "action=" + name + ", x=" + x + ", y=" + y);
         if (!tapped) {
             return false;
         }
-        SystemClock.sleep(WAIT_AFTER_TAP_MS);
+        delay.sleep(WAIT_AFTER_TAP_MS);
         return !cancel.cancelled();
+    }
+
+    private static ActionBoundary cancelBoundary(final CancelToken cancel) {
+        return new ActionBoundary() {
+            @Override public boolean checkpoint() {
+                return !cancel.cancelled();
+            }
+        };
     }
 
     private static TapAction chapterStepAction(int step, String name) {

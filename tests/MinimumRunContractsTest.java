@@ -1564,8 +1564,8 @@ final class MinimumRunContractsTest {
                 AutomationOutcome.SUCCESS,
                 "自动远征：完成",
                 "collected=0",
-                "log",
-                ""
+                "nested-pass.log",
+                "nested-pass.png"
         );
         AutomationUpdate forwarded = AutoExpeditionSchedulerRunner.forwardedPassUpdate(
                 passFinal,
@@ -1575,6 +1575,8 @@ final class MinimumRunContractsTest {
         assertEquals(AutomationOutcome.RUNNING, forwarded.outcome);
         assertContains(forwarded.message, "自动远征：等待下次检查");
         assertContains(forwarded.detail, "自动远征：完成");
+        assertEquals("nested-pass.log", forwarded.logPath);
+        assertEquals("nested-pass.png", forwarded.screenshotPath);
     }
 
     private static void autoExpeditionSchedulerWaitAndStopPreserveLatestEvidencePaths() {

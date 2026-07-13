@@ -15,6 +15,14 @@ final class LiveCombatFlowWaiter {
         void onUpdate(Update update);
     }
 
+    interface WorkerOperation {
+        void run();
+    }
+
+    interface UpdateEmitter {
+        void emit(Update update);
+    }
+
     private static final long DEFAULT_TIMEOUT_MS = 6000L;
     private static final long DEFAULT_POLL_INTERVAL_MS = 250L;
     private static final long FINAL_SCAN_GRACE_MS = 1200L;
@@ -35,6 +43,8 @@ final class LiveCombatFlowWaiter {
 
     private volatile boolean cancelled;
     private volatile boolean running;
+    private final OneShotStartGate startGate = new OneShotStartGate();
+    private boolean terminalPosted;
     private Thread worker;
 
     private LiveCombatFlowWaiter(
@@ -113,15 +123,31 @@ final class LiveCombatFlowWaiter {
     }
 
     synchronized boolean start() {
-        if (running) {
+        OneShotStartGate.Decision decision = startGate.claim(cancelled);
+        if (decision == OneShotStartGate.Decision.REJECTED) {
             return false;
         }
-        cancelled = false;
+        if (decision == OneShotStartGate.Decision.PRE_CANCELLED) {
+            post(Update.cancelled(0, 0L, "preStart=cancelled"));
+            return true;
+        }
         running = true;
         worker = new Thread(new Runnable() {
             @Override
             public void run() {
-                runLoop();
+                try {
+                    runWorkerBoundary(new WorkerOperation() {
+                        @Override public void run() {
+                            runLoop();
+                        }
+                    }, new UpdateEmitter() {
+                        @Override public void emit(Update update) {
+                            post(update);
+                        }
+                    });
+                } finally {
+                    running = false;
+                }
             }
         }, "AutoWSGR-live-combat-wait");
         worker.setPriority(Thread.MIN_PRIORITY);
@@ -129,7 +155,7 @@ final class LiveCombatFlowWaiter {
         return true;
     }
 
-    void cancel() {
+    synchronized void cancel() {
         cancelled = true;
         Thread active = worker;
         if (active != null) {
@@ -216,6 +242,21 @@ final class LiveCombatFlowWaiter {
         }
     }
 
+    static void runWorkerBoundary(WorkerOperation operation, UpdateEmitter emitter) {
+        if (operation == null || emitter == null) {
+            throw new IllegalArgumentException("operation and emitter are required");
+        }
+        try {
+            operation.run();
+        } catch (Throwable failure) {
+            emitter.emit(Update.failed(
+                    0,
+                    0L,
+                    "worker-exception=" + failure.getClass().getName() + ": " + failure.getMessage()
+            ));
+        }
+    }
+
     static boolean shouldAttemptFinalScanAtTimeout(long elapsedMs, long timeoutMs) {
         return timeoutMs >= 0L && elapsedMs >= timeoutMs;
     }
@@ -291,13 +332,42 @@ final class LiveCombatFlowWaiter {
         }
     }
 
-    private void post(final Update update) {
-        mainHandler.post(new Runnable() {
+    private void post(Update update) {
+        synchronized (this) {
+            if (update.running) {
+                if (cancelled || terminalPosted) {
+                    return;
+                }
+            } else {
+                if (terminalPosted) {
+                    return;
+                }
+                if (cancelled && !update.cancelled) {
+                    update = Update.cancelled(
+                            update.attempts,
+                            update.elapsedMs,
+                            update.detail + "\ncancellation=won terminal race"
+                    );
+                }
+                terminalPosted = true;
+            }
+        }
+        final Update deliveryUpdate = update;
+        Runnable delivery = new Runnable() {
             @Override
             public void run() {
-                callback.onUpdate(update);
+                callback.onUpdate(deliveryUpdate);
             }
-        });
+        };
+        boolean posted;
+        try {
+            posted = mainHandler.post(delivery);
+        } catch (RuntimeException handlerFailure) {
+            posted = false;
+        }
+        if (!posted) {
+            delivery.run();
+        }
     }
 
     private static String formatRecognition(NativeCombatRecognizer.Recognition recognition) {
@@ -368,6 +438,7 @@ final class LiveCombatFlowWaiter {
         final boolean matched;
         final boolean cancelled;
         final boolean timedOut;
+        final boolean failed;
         final int attempts;
         final long elapsedMs;
         final String detail;
@@ -377,6 +448,7 @@ final class LiveCombatFlowWaiter {
                 boolean matched,
                 boolean cancelled,
                 boolean timedOut,
+                boolean failed,
                 int attempts,
                 long elapsedMs,
                 String detail
@@ -385,25 +457,30 @@ final class LiveCombatFlowWaiter {
             this.matched = matched;
             this.cancelled = cancelled;
             this.timedOut = timedOut;
+            this.failed = failed;
             this.attempts = attempts;
             this.elapsedMs = elapsedMs;
             this.detail = detail;
         }
 
         static Update progress(int attempts, long elapsedMs, String detail) {
-            return new Update(true, false, false, false, attempts, elapsedMs, detail);
+            return new Update(true, false, false, false, false, attempts, elapsedMs, detail);
         }
 
         static Update matched(int attempts, long elapsedMs, String detail) {
-            return new Update(false, true, false, false, attempts, elapsedMs, detail);
+            return new Update(false, true, false, false, false, attempts, elapsedMs, detail);
         }
 
         static Update cancelled(int attempts, long elapsedMs, String detail) {
-            return new Update(false, false, true, false, attempts, elapsedMs, detail);
+            return new Update(false, false, true, false, false, attempts, elapsedMs, detail);
         }
 
         static Update timedOut(int attempts, long elapsedMs, String detail) {
-            return new Update(false, false, false, true, attempts, elapsedMs, detail);
+            return new Update(false, false, false, true, false, attempts, elapsedMs, detail);
+        }
+
+        static Update failed(int attempts, long elapsedMs, String detail) {
+            return new Update(false, false, false, false, true, attempts, elapsedMs, detail);
         }
 
         String toStatusLine() {
@@ -419,7 +496,7 @@ final class LiveCombatFlowWaiter {
             if (timedOut) {
                 return "Live combat wait: timed out after " + elapsedMs + "ms";
             }
-            return "Live combat wait: failed";
+            return failed ? "Live combat wait: failed" : "Live combat wait: invalid terminal";
         }
     }
 }

@@ -836,8 +836,10 @@ public final class MainActivity extends Activity {
                     outcome = AutomationOutcome.CANCELLED;
                 } else if (update.timedOut) {
                     outcome = AutomationOutcome.BLOCKED;
-                } else {
+                } else if (update.failed) {
                     outcome = AutomationOutcome.FAILED;
+                } else {
+                    outcome = AutomationOutcome.BLOCKED;
                 }
                 target.onUpdate(AutomationUpdate.terminal(
                         "waiter", runId, outcome, message, update.detail, "", ""

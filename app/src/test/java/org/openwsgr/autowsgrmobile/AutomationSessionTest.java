@@ -126,6 +126,119 @@ public final class AutomationSessionTest {
         ));
     }
 
+    @Test public void cancellationThatLinearizesFirstForcesCancelledTerminal() throws Exception {
+        AutomationControl control = new AutomationControl();
+        RecordingSink sink = new RecordingSink();
+        List<AutomationUpdate> updates = Collections.synchronizedList(new ArrayList<>());
+        AutomationSession session = new AutomationSession(
+                "normal", "cancel-wins", control, sink, updates::add
+        );
+        CountDownLatch actionEntered = new CountDownLatch(1);
+        CountDownLatch releaseAction = new CountDownLatch(1);
+        Thread action = new Thread(() -> {
+            try {
+                control.performAction(() -> {
+                    actionEntered.countDown();
+                    try {
+                        releaseAction.await();
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                    }
+                    return true;
+                });
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "cancel-wins-held-action");
+        action.start();
+        assertTrue(actionEntered.await(1, TimeUnit.SECONDS));
+
+        Thread cancel = new Thread(session::cancel, "cancel-wins-cancel");
+        cancel.start();
+        boolean cancelBlocked = awaitThreadState(cancel, Thread.State.BLOCKED, 1000L);
+        if (!cancelBlocked) {
+            releaseAction.countDown();
+        }
+        assertTrue("cancel must own the session lock while waiting for the action lock",
+                cancelBlocked);
+
+        AtomicReference<Boolean> finishResult = new AtomicReference<>();
+        Thread finish = new Thread(() -> finishResult.set(session.finish(
+                AutomationOutcome.SUCCESS, "完成", "success raced cancel", false
+        )), "cancel-wins-finish");
+        finish.start();
+        Thread.sleep(100);
+        assertNull(finishResult.get());
+
+        releaseAction.countDown();
+        action.join(1000);
+        cancel.join(1000);
+        finish.join(1000);
+        assertFalse(action.isAlive());
+        assertFalse(cancel.isAlive());
+        assertFalse(finish.isAlive());
+        assertEquals(Boolean.TRUE, finishResult.get());
+        assertEquals(1, countTerminal(updates));
+        assertEquals(AutomationOutcome.CANCELLED, updates.get(0).outcome);
+        assertEquals(0, sink.saveCalls.get());
+    }
+
+    @Test public void terminalThatLinearizesFirstIsNotReplacedByLaterCancel() throws Exception {
+        BlockingAppendSink sink = new BlockingAppendSink();
+        List<AutomationUpdate> updates = Collections.synchronizedList(new ArrayList<>());
+        AutomationSession session = new AutomationSession(
+                "campaign", "finish-wins", new AutomationControl(), sink, updates::add
+        );
+
+        Thread finish = new Thread(() -> session.finish(
+                AutomationOutcome.SUCCESS, "完成", "terminal claimed first", false
+        ), "finish-wins-finish");
+        finish.start();
+        assertTrue(sink.appendEntered.await(1, TimeUnit.SECONDS));
+
+        Thread cancel = new Thread(session::cancel, "finish-wins-cancel");
+        cancel.start();
+        Thread.sleep(100);
+        assertTrue("cancel must wait while terminal owns the session lock", cancel.isAlive());
+
+        sink.releaseAppend.countDown();
+        finish.join(1000);
+        cancel.join(1000);
+        assertFalse(finish.isAlive());
+        assertFalse(cancel.isAlive());
+        assertEquals(1, countTerminal(updates));
+        assertEquals(AutomationOutcome.SUCCESS, updates.get(0).outcome);
+    }
+
+    @Test public void adoptedNestedEvidenceSurvivesRunningAndCancellationTerminal() {
+        RecordingSink sink = new RecordingSink();
+        List<AutomationUpdate> updates = new ArrayList<>();
+        AutomationSession session = new AutomationSession(
+                "expedition", "scheduler", new AutomationControl(), sink, updates::add
+        );
+        AutomationUpdate nested = AutomationUpdate.progress(
+                "expedition", "pass", "本轮", "collecting",
+                "nested-pass.log", "nested-pass.png"
+        );
+
+        session.adoptEvidence(nested);
+        session.progress("调度中", "forwarded pass");
+        session.cancel();
+        assertTrue(session.finish(
+                AutomationOutcome.FAILED, "本轮失败", "cancel won", true
+        ));
+
+        assertEquals(2, updates.size());
+        assertEquals(AutomationOutcome.RUNNING, updates.get(0).outcome);
+        assertEquals("nested-pass.log", updates.get(0).logPath);
+        assertEquals("nested-pass.png", updates.get(0).screenshotPath);
+        assertEquals(AutomationOutcome.CANCELLED, updates.get(1).outcome);
+        assertEquals("nested-pass.log", updates.get(1).logPath);
+        assertEquals("nested-pass.png", updates.get(1).screenshotPath);
+        assertEquals("cancel must not replace adopted evidence with a failure capture",
+                0, sink.saveCalls.get());
+    }
+
     private static int countContaining(List<String> lines, String needle) {
         int count = 0;
         synchronized (lines) {
@@ -150,6 +263,18 @@ public final class AutomationSessionTest {
         return count;
     }
 
+    private static boolean awaitThreadState(Thread thread, Thread.State state, long timeoutMs)
+            throws InterruptedException {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        while (System.nanoTime() < deadline) {
+            if (thread.getState() == state) {
+                return true;
+            }
+            Thread.sleep(5L);
+        }
+        return thread.getState() == state;
+    }
+
     private static final class RecordingSink implements AutomationSession.Sink {
         final List<String> lines = Collections.synchronizedList(new ArrayList<>());
         final AtomicInteger saveCalls = new AtomicInteger();
@@ -161,5 +286,22 @@ public final class AutomationSessionTest {
             saveCalls.incrementAndGet();
             return "failure.png";
         }
+    }
+
+    private static final class BlockingAppendSink implements AutomationSession.Sink {
+        final CountDownLatch appendEntered = new CountDownLatch(1);
+        final CountDownLatch releaseAppend = new CountDownLatch(1);
+
+        @Override public void append(String line) throws IOException {
+            appendEntered.countDown();
+            try {
+                releaseAppend.await();
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        @Override public String logPath() { return "finish-first.log"; }
+        @Override public String saveFailure(String runId) { return "finish-first.png"; }
     }
 }

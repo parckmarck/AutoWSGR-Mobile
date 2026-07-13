@@ -17,6 +17,7 @@ final class ExpeditionCollectionRunner {
     private final Context appContext;
     private final AutoExpeditionConfig config;
     private final AutomationSession session;
+    private final OneShotStartGate startGate = new OneShotStartGate();
     private final MinimumGameStateRecognizer recognizer;
     private final MinimumNormalBattleNavigator homeNavigator;
     private final ExpeditionCollectionNavigator expeditionNavigator;
@@ -58,9 +59,24 @@ final class ExpeditionCollectionRunner {
         return "success";
     }
 
+    static AutomationOutcome notificationOutcome(NotificationProbe probe, int collected) {
+        if (probe == null || !probe.available) {
+            return AutomationOutcome.BLOCKED;
+        }
+        if (probe.matched) {
+            return AutomationOutcome.RUNNING;
+        }
+        return collected > 0 ? AutomationOutcome.SUCCESS : AutomationOutcome.NO_ACTION;
+    }
+
     synchronized boolean start() {
-        if (running) {
+        OneShotStartGate.Decision decision = startGate.claim(session.cancelled());
+        if (decision == OneShotStartGate.Decision.REJECTED) {
             return false;
+        }
+        if (decision == OneShotStartGate.Decision.PRE_CANCELLED) {
+            finishCancelled();
+            return true;
         }
         running = true;
         progress("自动远征：启动中", startupSummary(config));
@@ -189,7 +205,8 @@ final class ExpeditionCollectionRunner {
                 finishCancelled();
                 return null;
             }
-            if (!homeNavigator.tapStartScreenEnter(homeCancelToken(), homeNavigatorLogger())) {
+            if (!homeNavigator.tapStartScreenEnter(
+                    homeCancelToken(), session::checkpoint, homeNavigatorLogger())) {
                 finishBlockedOrCancelled("tap-start-screen-enter-failed");
                 return null;
             }
@@ -201,7 +218,13 @@ final class ExpeditionCollectionRunner {
     }
 
     private void runFromHome(MinimumGameStateRecognizer.Result home) {
-        if (!hasMainReadyNotification()) {
+        NotificationProbe notification = probeMainReadyNotification();
+        AutomationOutcome notificationOutcome = notificationOutcome(notification, 0);
+        if (notificationOutcome == AutomationOutcome.BLOCKED) {
+            finishBlocked("main-notification-probe-unavailable, " + notification.detail);
+            return;
+        }
+        if (notificationOutcome == AutomationOutcome.NO_ACTION) {
             finishNoAction("collected=0, reason=no-main-notification");
             return;
         }
@@ -209,7 +232,8 @@ final class ExpeditionCollectionRunner {
             finishCancelled();
             return;
         }
-        if (!homeNavigator.tapHomeMap(home, homeCancelToken(), homeNavigatorLogger())) {
+        if (!homeNavigator.tapHomeMap(
+                home, homeCancelToken(), session::checkpoint, homeNavigatorLogger())) {
             finishBlockedOrCancelled("tap-home-map-failed");
             return;
         }
@@ -225,7 +249,13 @@ final class ExpeditionCollectionRunner {
     }
 
     private void runFromMapPage() {
-        if (!hasMapNotification()) {
+        NotificationProbe notification = probeMapNotification();
+        AutomationOutcome notificationOutcome = notificationOutcome(notification, 0);
+        if (notificationOutcome == AutomationOutcome.BLOCKED) {
+            finishBlocked("map-notification-probe-unavailable, " + notification.detail);
+            return;
+        }
+        if (notificationOutcome == AutomationOutcome.NO_ACTION) {
             if (session.cancelled()) {
                 finishCancelled();
                 return;
@@ -269,19 +299,41 @@ final class ExpeditionCollectionRunner {
                 finishCancelled();
                 return;
             }
-            int slot = findReadySlot();
+            SlotProbe slotProbe = findReadySlot();
+            if (!slotProbe.available) {
+                finishBlockedOrCancelled("ready-slot-probe-unavailable, " + slotProbe.detail);
+                return;
+            }
+            int slot = slotProbe.slot;
             if (slot < 0) {
-                if (!hasMapNotification()) {
+                NotificationProbe notification = probeMapNotification();
+                AutomationOutcome notificationOutcome = notificationOutcome(notification, collected);
+                if (notificationOutcome == AutomationOutcome.BLOCKED) {
+                    finishBlocked("map-notification-probe-unavailable, " + notification.detail);
+                    return;
+                }
+                if (notificationOutcome.terminal) {
                     finishCollected(collected, "reason=no-map-notification");
                     return;
                 }
-                slot = waitForReadySlot();
+                slotProbe = waitForReadySlot();
+                if (!slotProbe.available) {
+                    finishBlockedOrCancelled("ready-slot-probe-unavailable, " + slotProbe.detail);
+                    return;
+                }
+                slot = slotProbe.slot;
                 if (slot < 0) {
                     if (session.cancelled()) {
                         finishCancelled();
                         return;
                     }
-                    if (!hasMapNotification()) {
+                    notification = probeMapNotification();
+                    notificationOutcome = notificationOutcome(notification, collected);
+                    if (notificationOutcome == AutomationOutcome.BLOCKED) {
+                        finishBlocked("map-notification-probe-unavailable, " + notification.detail);
+                        return;
+                    }
+                    if (notificationOutcome.terminal) {
                         finishCollected(collected, "reason=no-map-notification");
                         return;
                     }
@@ -336,7 +388,13 @@ final class ExpeditionCollectionRunner {
                 return;
             }
             collected++;
-            boolean slotCleared = !slotStillReady(slot);
+            NotificationProbe readyAfterCollection = probeSlotReady(slot);
+            if (!readyAfterCollection.available) {
+                finishBlocked("slot-clear-probe-unavailable, slot=" + slot
+                        + ", " + readyAfterCollection.detail);
+                return;
+            }
+            boolean slotCleared = !readyAfterCollection.matched;
             progress("自动远征：已收取远征", "collected=" + collected + "/" + MAX_COLLECTIONS
                     + ", slot=" + slot
                     + ", slotCleared=" + slotCleared);
@@ -357,21 +415,28 @@ final class ExpeditionCollectionRunner {
         finishSuccess("collected=" + collected + ", reason=max-collections");
     }
 
-    private int waitForReadySlot() {
+    private SlotProbe waitForReadySlot() {
         long started = SystemClock.elapsedRealtime();
         int polls = 0;
         while (!session.cancelled() && SystemClock.elapsedRealtime() - started < SLOT_REFRESH_TIMEOUT_MS) {
             if (!session.checkpoint()) {
-                return -1;
+                return SlotProbe.unavailable("checkpoint stopped");
             }
-            int slot = findReadySlot();
-            if (slot >= 0) {
-                progress("自动远征：检测到完成槽位", "slot=" + slot);
+            SlotProbe slot = findReadySlot();
+            if (!slot.available) {
                 return slot;
             }
-            if (!hasMapNotification()) {
+            if (slot.slot >= 0) {
+                progress("自动远征：检测到完成槽位", "slot=" + slot.slot);
+                return slot;
+            }
+            NotificationProbe notification = probeMapNotification();
+            if (!notification.available) {
+                return SlotProbe.unavailable(notification.detail);
+            }
+            if (!notification.matched) {
                 progress("自动远征：远征通知已消失", "readySlot=none");
-                return -1;
+                return SlotProbe.none("map notification absent");
             }
             if (polls == 0 || polls % 8 == 0) {
                 progress("自动远征：等待完成槽位", "poll=" + polls);
@@ -379,90 +444,130 @@ final class ExpeditionCollectionRunner {
             polls++;
             SystemClock.sleep(250L);
         }
-        return -1;
+        return SlotProbe.none("ready-slot-timeout");
     }
 
-    private boolean hasMainReadyNotification() {
+    private NotificationProbe probeMainReadyNotification() {
         final Bitmap source = ScreenFrameStore.latestBitmap();
         if (source == null) {
-            return false;
+            return NotificationProbe.unavailable("missing MediaProjection frame");
         }
-        final Bitmap frame = GameFrameNormalizer.toLandscapeGameFrame(source);
+        Bitmap frame = null;
         try {
-            return ExpeditionCollectionSignatures.hasMainReadyNotification(
+            frame = GameFrameNormalizer.toLandscapeGameFrame(source);
+            if (frame == null) {
+                return NotificationProbe.unavailable("main notification frame normalization unavailable");
+            }
+            final Bitmap sampledFrame = frame;
+            boolean matched = ExpeditionCollectionSignatures.hasMainReadyNotification(
                     new ExpeditionCollectionSignatures.Sampler() {
                         @Override
                         public int sample(float normalizedX, float normalizedY) {
-                            return sampleFrame(frame, normalizedX, normalizedY);
+                            return sampleFrame(sampledFrame, normalizedX, normalizedY);
                         }
                     }
             );
+            return NotificationProbe.available(matched);
+        } catch (RuntimeException failure) {
+            return NotificationProbe.unavailable("main notification probe failed: " + failure);
         } finally {
-            frame.recycle();
+            if (frame != null) {
+                frame.recycle();
+            }
             source.recycle();
         }
     }
 
-    private boolean hasMapNotification() {
+    private NotificationProbe probeMapNotification() {
         final Bitmap source = ScreenFrameStore.latestBitmap();
         if (source == null) {
-            return false;
+            return NotificationProbe.unavailable("missing MediaProjection frame");
         }
-        final Bitmap frame = GameFrameNormalizer.toLandscapeGameFrame(source);
+        Bitmap frame = null;
         try {
-            return ExpeditionCollectionSignatures.hasMapExpeditionNotification(
+            frame = GameFrameNormalizer.toLandscapeGameFrame(source);
+            if (frame == null) {
+                return NotificationProbe.unavailable("map notification frame normalization unavailable");
+            }
+            final Bitmap sampledFrame = frame;
+            boolean matched = ExpeditionCollectionSignatures.hasMapExpeditionNotification(
                     new ExpeditionCollectionSignatures.Sampler() {
                         @Override
                         public int sample(float normalizedX, float normalizedY) {
-                            return sampleFrame(frame, normalizedX, normalizedY);
+                            return sampleFrame(sampledFrame, normalizedX, normalizedY);
                         }
                     }
             );
+            return NotificationProbe.available(matched);
+        } catch (RuntimeException failure) {
+            return NotificationProbe.unavailable("map notification probe failed: " + failure);
         } finally {
-            frame.recycle();
+            if (frame != null) {
+                frame.recycle();
+            }
             source.recycle();
         }
     }
 
-    private int findReadySlot() {
+    private SlotProbe findReadySlot() {
         final Bitmap source = ScreenFrameStore.latestBitmap();
         if (source == null) {
-            return -1;
+            return SlotProbe.unavailable("missing MediaProjection frame");
         }
-        final Bitmap frame = GameFrameNormalizer.toLandscapeGameFrame(source);
+        Bitmap frame = null;
         try {
-            return ExpeditionCollectionSignatures.findReadySlot(
+            frame = GameFrameNormalizer.toLandscapeGameFrame(source);
+            if (frame == null) {
+                return SlotProbe.unavailable("ready slot frame normalization unavailable");
+            }
+            final Bitmap sampledFrame = frame;
+            int slot = ExpeditionCollectionSignatures.findReadySlot(
                     new ExpeditionCollectionSignatures.Sampler() {
                         @Override
                         public int sample(float normalizedX, float normalizedY) {
-                            return sampleFrame(frame, normalizedX, normalizedY);
+                            return sampleFrame(sampledFrame, normalizedX, normalizedY);
                         }
                     }
             );
+            return slot < 0 ? SlotProbe.none("no ready slot") : SlotProbe.ready(slot);
+        } catch (RuntimeException failure) {
+            return SlotProbe.unavailable("ready slot probe failed: " + failure);
         } finally {
-            frame.recycle();
+            if (frame != null) {
+                frame.recycle();
+            }
             source.recycle();
         }
     }
 
-    private boolean slotStillReady(final int slot) {
+    private NotificationProbe probeSlotReady(final int slot) {
         final Bitmap source = ScreenFrameStore.latestBitmap();
         if (source == null) {
-            return false;
+            return NotificationProbe.unavailable("missing MediaProjection frame");
         }
-        final Bitmap frame = GameFrameNormalizer.toLandscapeGameFrame(source);
+        Bitmap frame = null;
         try {
-            return ExpeditionCollectionSignatures.slotReady(
+            frame = GameFrameNormalizer.toLandscapeGameFrame(source);
+            if (frame == null) {
+                return NotificationProbe.unavailable("slot clear frame normalization unavailable");
+            }
+            final Bitmap sampledFrame = frame;
+            boolean matched = ExpeditionCollectionSignatures.slotReady(
                     new ExpeditionCollectionSignatures.Sampler() {
                         @Override
                         public int sample(float normalizedX, float normalizedY) {
-                            return sampleFrame(frame, normalizedX, normalizedY);
+                            return sampleFrame(sampledFrame, normalizedX, normalizedY);
                         }
                     },
                     slot
             );
+            return NotificationProbe.available(matched);
+        } catch (RuntimeException failure) {
+            return NotificationProbe.unavailable("slot clear probe failed: " + failure);
         } finally {
-            frame.recycle();
+            if (frame != null) {
+                frame.recycle();
+            }
             source.recycle();
         }
     }
@@ -498,6 +603,7 @@ final class ExpeditionCollectionRunner {
                         overlay.kind,
                         overlay.newsNotShowChecked,
                         overlayCancelToken(),
+                        session::checkpoint,
                         overlayNavigatorLogger()
                 )) {
                     finishBlockedOrCancelled("dismiss-main-overlay-failed, overlay=" + overlay.kind);
@@ -752,6 +858,51 @@ final class ExpeditionCollectionRunner {
         running = false;
         worker = null;
         session.finish(outcome, message, detail, saveFailure);
+    }
+
+    static final class NotificationProbe {
+        final boolean available;
+        final boolean matched;
+        final String detail;
+
+        private NotificationProbe(boolean available, boolean matched, String detail) {
+            this.available = available;
+            this.matched = matched;
+            this.detail = detail == null ? "" : detail;
+        }
+
+        static NotificationProbe unavailable(String detail) {
+            return new NotificationProbe(false, false, detail);
+        }
+
+        static NotificationProbe available(boolean matched) {
+            return new NotificationProbe(true, matched,
+                    matched ? "notification matched" : "notification explicitly absent");
+        }
+    }
+
+    private static final class SlotProbe {
+        final boolean available;
+        final int slot;
+        final String detail;
+
+        private SlotProbe(boolean available, int slot, String detail) {
+            this.available = available;
+            this.slot = slot;
+            this.detail = detail == null ? "" : detail;
+        }
+
+        static SlotProbe unavailable(String detail) {
+            return new SlotProbe(false, -1, detail);
+        }
+
+        static SlotProbe none(String detail) {
+            return new SlotProbe(true, -1, detail);
+        }
+
+        static SlotProbe ready(int slot) {
+            return new SlotProbe(true, slot, "ready slot=" + slot);
+        }
     }
 
     private void progress(String status, String detail) {

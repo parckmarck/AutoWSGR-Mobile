@@ -1,6 +1,10 @@
 package org.openwsgr.autowsgrmobile;
 
 final class AutomationControl {
+    interface Action {
+        boolean run();
+    }
+
     private boolean paused;
     private boolean cancelled;
 
@@ -34,5 +38,18 @@ final class AutomationControl {
             wait();
         }
         return !cancelled;
+    }
+
+    synchronized boolean performAction(Action action) throws InterruptedException {
+        if (action == null) {
+            throw new IllegalArgumentException("action is required");
+        }
+        while (paused && !cancelled) {
+            wait();
+        }
+        if (cancelled) {
+            return false;
+        }
+        return action.run();
     }
 }
