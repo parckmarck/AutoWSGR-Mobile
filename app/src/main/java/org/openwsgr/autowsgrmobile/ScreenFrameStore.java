@@ -8,7 +8,7 @@ import java.nio.ByteBuffer;
 final class ScreenFrameStore {
     private static final Object LOCK = new Object();
 
-    private static byte[] latestRgba;
+    private static int[] latestArgb;
     private static int width;
     private static int height;
     private static long lastFrameTimeMs;
@@ -27,23 +27,21 @@ final class ScreenFrameStore {
         int imageHeight = image.getHeight();
         int pixelStride = plane.getPixelStride();
         int rowStride = plane.getRowStride();
-        byte[] tight = new byte[imageWidth * imageHeight * 4];
-
-        for (int y = 0; y < imageHeight; y++) {
-            int srcRow = y * rowStride;
-            int dstRow = y * imageWidth * 4;
-            for (int x = 0; x < imageWidth; x++) {
-                int src = srcRow + x * pixelStride;
-                int dst = dstRow + x * 4;
-                tight[dst] = buffer.get(src);
-                tight[dst + 1] = buffer.get(src + 1);
-                tight[dst + 2] = buffer.get(src + 2);
-                tight[dst + 3] = buffer.get(src + 3);
-            }
+        byte[] tight = FrameBufferCopier.copyRgba(
+                buffer, imageWidth, imageHeight, pixelStride, rowStride
+        );
+        int[] pixels = new int[imageWidth * imageHeight];
+        for (int i = 0; i < pixels.length; i++) {
+            int offset = i * 4;
+            int r = tight[offset] & 0xff;
+            int g = tight[offset + 1] & 0xff;
+            int b = tight[offset + 2] & 0xff;
+            int a = tight[offset + 3] & 0xff;
+            pixels[i] = (a << 24) | (r << 16) | (g << 8) | b;
         }
 
         synchronized (LOCK) {
-            latestRgba = tight;
+            latestArgb = pixels;
             width = imageWidth;
             height = imageHeight;
             lastFrameTimeMs = System.currentTimeMillis();
@@ -53,55 +51,48 @@ final class ScreenFrameStore {
 
     static Snapshot snapshot() {
         synchronized (LOCK) {
-            return new Snapshot(width, height, lastFrameTimeMs, frameCount, latestRgba == null ? 0 : latestRgba.length);
+            return new Snapshot(width, height, lastFrameTimeMs, frameCount,
+                    latestArgb == null ? 0 : latestArgb.length * 4);
         }
     }
 
     static Bitmap latestBitmap() {
-        byte[] rgba;
+        int[] pixels;
         int bitmapWidth;
         int bitmapHeight;
         synchronized (LOCK) {
-            if (latestRgba == null || width <= 0 || height <= 0) {
+            if (latestArgb == null || width <= 0 || height <= 0) {
                 return null;
             }
-            rgba = latestRgba.clone();
+            pixels = latestArgb.clone();
             bitmapWidth = width;
             bitmapHeight = height;
         }
 
-        int[] pixels = new int[bitmapWidth * bitmapHeight];
-        for (int i = 0; i < pixels.length; i++) {
-            int offset = i * 4;
-            int r = rgba[offset] & 0xff;
-            int g = rgba[offset + 1] & 0xff;
-            int b = rgba[offset + 2] & 0xff;
-            int a = rgba[offset + 3] & 0xff;
-            pixels[i] = (a << 24) | (r << 16) | (g << 8) | b;
-        }
-        Bitmap bitmap = Bitmap.createBitmap(bitmapWidth, bitmapHeight, Bitmap.Config.ARGB_8888);
-        bitmap.setPixels(pixels, 0, bitmapWidth, 0, 0, bitmapWidth, bitmapHeight);
-        return bitmap;
+        return Bitmap.createBitmap(
+                pixels, bitmapWidth, bitmapHeight, Bitmap.Config.ARGB_8888
+        );
     }
 
     static PixelSample sampleNormalized(float normalizedX, float normalizedY) {
         synchronized (LOCK) {
-            if (latestRgba == null || width <= 0 || height <= 0) {
+            if (latestArgb == null || width <= 0 || height <= 0) {
                 return PixelSample.unavailable("no frame");
             }
             int x = Math.min(width - 1, Math.max(0, Math.round(clamp(normalizedX) * (width - 1))));
             int y = Math.min(height - 1, Math.max(0, Math.round(clamp(normalizedY) * (height - 1))));
-            int offset = (y * width + x) * 4;
-            if (offset + 3 >= latestRgba.length) {
+            int index = y * width + x;
+            if (index < 0 || index >= latestArgb.length) {
                 return PixelSample.unavailable("sample out of range");
             }
+            int argb = latestArgb[index];
             return PixelSample.available(
                     x,
                     y,
-                    latestRgba[offset] & 0xff,
-                    latestRgba[offset + 1] & 0xff,
-                    latestRgba[offset + 2] & 0xff,
-                    latestRgba[offset + 3] & 0xff
+                    (argb >>> 16) & 0xff,
+                    (argb >>> 8) & 0xff,
+                    argb & 0xff,
+                    (argb >>> 24) & 0xff
             );
         }
     }
