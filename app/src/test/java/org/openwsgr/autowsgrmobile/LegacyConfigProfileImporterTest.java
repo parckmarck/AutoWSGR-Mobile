@@ -56,6 +56,23 @@ public final class LegacyConfigProfileImporterTest {
         assertFalse(new File(configs, "从旧版配置迁移.yaml").exists());
     }
 
+    @Test public void utf8BomIsStrippedFromFirstLegacySetting() throws Exception {
+        File base = temporaryFolder.newFolder("bom");
+        File legacy = new File(base, "config");
+        assertTrue(legacy.mkdirs());
+        write(new File(legacy, "normal-sortie.yaml"),
+                "\uFEFFplan_path: autowsgr/data/plan/normal_fight/5-2.yaml\n");
+
+        ConfigProfile imported = LegacyConfigProfileImporter.importIfNeeded(
+                repository(new File(base, "configs")),
+                legacy
+        );
+        UnifiedAutomationConfig config = UnifiedAutomationConfig.parse(imported.id, imported.yaml);
+
+        assertEquals("autowsgr/data/plan/normal_fight/5-2.yaml", config.normalSortie.planPath);
+        assertFalse(imported.yaml.contains("\uFEFF"));
+    }
+
     private static ConfigProfileRepository repository(File configs) {
         return new ConfigProfileRepository(
                 configs,

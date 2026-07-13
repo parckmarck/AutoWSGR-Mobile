@@ -3,6 +3,7 @@ package org.openwsgr.autowsgrmobile;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.graphics.Typeface;
+import android.os.Bundle;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextWatcher;
@@ -22,6 +23,15 @@ import java.util.Collections;
 import java.util.List;
 
 final class ConfigProfileUiController {
+    private static final String STATE_PREFIX = "configProfileEditor.";
+    private static final String STATE_SELECTED_ID = STATE_PREFIX + "selectedId";
+    private static final String STATE_BUILT_IN = STATE_PREFIX + "builtIn";
+    private static final String STATE_DIRTY = STATE_PREFIX + "dirty";
+    private static final String STATE_EDITOR_TEXT = STATE_PREFIX + "editorText";
+    private static final String STATE_DEFAULT_ID = STATE_PREFIX + "defaultId";
+    private static final String STATE_NOTICE = STATE_PREFIX + "notice";
+    private static final String STATE_LAST_ERROR = STATE_PREFIX + "lastError";
+
     interface Listener {
         void onDefaultProfileChanged(ConfigProfile profile, UnifiedAutomationConfig config);
     }
@@ -37,7 +47,8 @@ final class ConfigProfileUiController {
     private String defaultProfileId = ConfigProfileRepository.BUILTIN_ID;
     private String lastError = "";
     private String notice = "";
-    private boolean changingSelection;
+    private final ConfigProfileUiState.SelectionGate selectionGate =
+            new ConfigProfileUiState.SelectionGate();
     private boolean changingEditor;
 
     ConfigProfileUiController(
@@ -113,7 +124,10 @@ final class ConfigProfileUiController {
         });
         profileSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
             @Override public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
-                if (!changingSelection && position >= 0 && position < profiles.size()) {
+                int currentPosition = profileSpinner.getSelectedItemPosition();
+                if (position >= 0 && position < profiles.size()
+                        && selectionGate.shouldSelectProfile(position, currentPosition)
+                        && !profiles.get(position).id.equals(state.selectedId())) {
                     selectProfile(profiles.get(position));
                 }
             }
@@ -159,6 +173,45 @@ final class ConfigProfileUiController {
         return lastError;
     }
 
+    void saveInstanceState(Bundle outState) {
+        if (outState == null || editor == null) {
+            return;
+        }
+        ConfigProfileUiState.EditorSnapshot snapshot = state.snapshot(
+                editorText(),
+                defaultProfileId,
+                notice,
+                lastError
+        );
+        outState.putString(STATE_SELECTED_ID, snapshot.selectedId);
+        outState.putBoolean(STATE_BUILT_IN, snapshot.builtIn);
+        outState.putBoolean(STATE_DIRTY, snapshot.dirty);
+        outState.putString(STATE_EDITOR_TEXT, snapshot.editorText);
+        outState.putString(STATE_DEFAULT_ID, snapshot.defaultProfileId);
+        outState.putString(STATE_NOTICE, snapshot.notice);
+        outState.putString(STATE_LAST_ERROR, snapshot.lastError);
+    }
+
+    void restoreInstanceState(Bundle savedState) {
+        if (savedState == null || !savedState.containsKey(STATE_SELECTED_ID)) {
+            return;
+        }
+        final ConfigProfileUiState.EditorSnapshot snapshot = new ConfigProfileUiState.EditorSnapshot(
+                savedState.getString(STATE_SELECTED_ID, ConfigProfileRepository.BUILTIN_ID),
+                savedState.getBoolean(STATE_BUILT_IN, true),
+                savedState.getBoolean(STATE_DIRTY, false),
+                savedState.getString(STATE_EDITOR_TEXT, ""),
+                savedState.getString(STATE_DEFAULT_ID, ConfigProfileRepository.BUILTIN_ID),
+                savedState.getString(STATE_NOTICE, ""),
+                savedState.getString(STATE_LAST_ERROR, "")
+        );
+        profileSpinner.post(new Runnable() {
+            @Override public void run() {
+                restoreSnapshot(snapshot);
+            }
+        });
+    }
+
     void showError(Exception error) {
         lastError = message(error);
         notice = "";
@@ -182,10 +235,14 @@ final class ConfigProfileUiController {
                 labels
         );
         adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-        changingSelection = true;
+        selectionGate.expectAdapterSelection(selectedPosition);
         profileSpinner.setAdapter(adapter);
-        profileSpinner.setSelection(selectedPosition);
-        changingSelection = false;
+        int currentPosition = profileSpinner.getSelectedItemPosition();
+        if (currentPosition != selectedPosition) {
+            selectionGate.expectSelection(currentPosition, selectedPosition);
+            profileSpinner.setSelection(selectedPosition);
+        }
+        clearExpectedSelectionLater(selectedPosition);
         selectProfile(profiles.get(selectedPosition));
     }
 
@@ -243,20 +300,34 @@ final class ConfigProfileUiController {
         nameInput.setHint("配置名称");
         nameInput.setSingleLine(true);
         nameInput.setInputType(InputType.TYPE_CLASS_TEXT);
-        new AlertDialog.Builder(activity)
+        final AlertDialog dialog = new AlertDialog.Builder(activity)
                 .setTitle("另存为")
                 .setView(nameInput)
                 .setNegativeButton("取消", null)
-                .setPositiveButton("保存", (dialog, which) -> saveAs(nameInput.getText().toString()))
-                .show();
+                .setPositiveButton("保存", null)
+                .create();
+        dialog.show();
+        dialog.getButton(AlertDialog.BUTTON_POSITIVE).setOnClickListener(new View.OnClickListener() {
+            @Override public void onClick(View view) {
+                if (saveAs(nameInput.getText().toString())) {
+                    dialog.dismiss();
+                }
+            }
+        });
     }
 
-    private void saveAs(String displayName) {
+    private boolean saveAs(String displayName) {
+        ConfigProfile saved;
         try {
-            ConfigProfile saved = repository.saveAs(displayName, editorText(), true, false);
+            saved = repository.saveAs(displayName, editorText(), true, false);
             defaultProfileId = saved.id;
             state.saved(saved);
             notifyDefault(saved);
+        } catch (Exception error) {
+            showError(error);
+            return false;
+        }
+        try {
             refreshProfilesOrThrow(saved.id);
             lastError = "";
             notice = "另存为成功并已设为默认。";
@@ -264,11 +335,15 @@ final class ConfigProfileUiController {
         } catch (Exception error) {
             showError(error);
         }
+        return true;
     }
 
     private void setSelectedDefault() {
+        if (!state.canSetDefault()) {
+            showError(new IOException("当前配置有未保存的修改，请先保存或另存为"));
+            return;
+        }
         try {
-            new CurrentConfigProfileValidator().validate(state.selectedId(), editorText());
             ConfigProfile selected = repository.setDefault(state.selectedId());
             UnifiedAutomationConfig config = UnifiedAutomationConfig.parse(selected.id, selected.yaml);
             defaultProfileId = selected.id;
@@ -289,12 +364,35 @@ final class ConfigProfileUiController {
     private void selectSpinner(String id) {
         for (int index = 0; index < profiles.size(); index++) {
             if (profiles.get(index).id.equals(id)) {
-                changingSelection = true;
-                profileSpinner.setSelection(index);
-                changingSelection = false;
+                int currentPosition = profileSpinner.getSelectedItemPosition();
+                if (selectionGate.expectSelection(currentPosition, index)) {
+                    profileSpinner.setSelection(index);
+                    clearExpectedSelectionLater(index);
+                }
                 return;
             }
         }
+    }
+
+    private void clearExpectedSelectionLater(final int position) {
+        profileSpinner.post(new Runnable() {
+            @Override public void run() {
+                selectionGate.clearExpectedSelection(position);
+            }
+        });
+    }
+
+    private void restoreSnapshot(ConfigProfileUiState.EditorSnapshot snapshot) {
+        selectSpinner(snapshot.selectedId);
+        state.restore(snapshot);
+        defaultProfileId = snapshot.defaultProfileId;
+        notice = snapshot.notice;
+        lastError = snapshot.lastError;
+        changingEditor = true;
+        editor.setText(snapshot.editorText);
+        editor.setSelection(editor.length());
+        changingEditor = false;
+        renderStatus();
     }
 
     private String editorText() {

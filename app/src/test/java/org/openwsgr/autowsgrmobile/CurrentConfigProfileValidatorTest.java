@@ -64,4 +64,31 @@ public final class CurrentConfigProfileValidatorTest {
         assertEquals("1", mappings.get("version"));
         assertEquals("keep: exactly # including comment\n", mappings.get("upstream_unknown"));
     }
+
+    @Test public void malformedTopLevelSequencesAndCommentColonsAreRejected() {
+        assertThrows(
+                IOException.class,
+                () -> validator.validate("sequence.yaml", "- normal_sortie: value\n")
+        );
+        assertThrows(
+                IOException.class,
+                () -> validator.validate("complex.yaml", "? normal_sortie: value\n")
+        );
+        assertThrows(
+                IOException.class,
+                () -> validator.validate("comment-colon.yaml", "normal_sortie # typo:\n")
+        );
+    }
+
+    @Test public void quotedScalarColonsAndHashesRemainValid() throws Exception {
+        String yaml = "version: 1\n"
+                + "profile_name: \"每日: #一号\" # trailing comment\n"
+                + "upstream_value: 'literal: # retained'\n";
+
+        validator.validate("quoted.yaml", yaml);
+        Map<String, String> mappings = YamlSectionExtractor.topLevelMappings("quoted.yaml", yaml);
+
+        assertEquals("\"每日: #一号\" # trailing comment", mappings.get("profile_name"));
+        assertEquals("'literal: # retained'", mappings.get("upstream_value"));
+    }
 }

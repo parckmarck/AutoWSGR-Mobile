@@ -62,7 +62,8 @@ final class LegacyConfigProfileImporter {
         if (!file.isFile()) {
             return defaultText;
         }
-        return new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8);
+        String text = new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8);
+        return text.startsWith("\uFEFF") ? text.substring(1) : text;
     }
 
     private static String section(String name, String text) {

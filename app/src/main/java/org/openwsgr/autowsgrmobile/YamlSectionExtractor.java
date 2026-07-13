@@ -43,7 +43,12 @@ final class YamlSectionExtractor {
             if (currentKey != null && !currentScalar) {
                 values.put(currentKey, currentBody.toString());
             }
-            int colon = line.indexOf(':');
+            String trimmedLine = line.trim();
+            if (trimmedLine.startsWith("-") || trimmedLine.startsWith("?")) {
+                throw new IOException(location + ": unsupported top-level YAML construct at line "
+                        + (index + 1));
+            }
+            int colon = mappingColon(line);
             String key = colon < 0 ? "" : line.substring(0, colon).trim();
             if (colon < 0 || key.isEmpty()) {
                 throw new IOException(location + ": invalid top-level mapping at line " + (index + 1));
@@ -73,5 +78,41 @@ final class YamlSectionExtractor {
             count++;
         }
         return count;
+    }
+
+    private static int mappingColon(String line) {
+        boolean singleQuoted = false;
+        boolean doubleQuoted = false;
+        for (int index = 0; index < line.length(); index++) {
+            char character = line.charAt(index);
+            if (doubleQuoted) {
+                if (character == '\\' && index + 1 < line.length()) {
+                    index++;
+                } else if (character == '"') {
+                    doubleQuoted = false;
+                }
+                continue;
+            }
+            if (singleQuoted) {
+                if (character == '\'' && index + 1 < line.length()
+                        && line.charAt(index + 1) == '\'') {
+                    index++;
+                } else if (character == '\'') {
+                    singleQuoted = false;
+                }
+                continue;
+            }
+            if (character == '#') {
+                return -1;
+            }
+            if (character == '"') {
+                doubleQuoted = true;
+            } else if (character == '\'') {
+                singleQuoted = true;
+            } else if (character == ':') {
+                return index;
+            }
+        }
+        return -1;
     }
 }

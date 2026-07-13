@@ -135,7 +135,14 @@ public final class MainActivity extends Activity {
         if (importError != null) {
             configProfileUiController.showError(importError);
         }
+        configProfileUiController.restoreInstanceState(savedInstanceState);
         requestNotificationPermissionIfNeeded();
+    }
+
+    @Override
+    protected void onSaveInstanceState(Bundle outState) {
+        configProfileUiController.saveInstanceState(outState);
+        super.onSaveInstanceState(outState);
     }
 
     @Override
