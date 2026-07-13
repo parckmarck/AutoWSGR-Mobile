@@ -14,6 +14,14 @@ final class AtomicTextFile {
     }
 
     static void write(File target, String text) throws IOException {
+        write(target, text, true);
+    }
+
+    static void writeWithoutReplacing(File target, String text) throws IOException {
+        write(target, text, false);
+    }
+
+    private static void write(File target, String text, boolean replaceExisting) throws IOException {
         if (target == null || text == null) {
             throw new IOException("target and text are required");
         }
@@ -32,11 +40,15 @@ final class AtomicTextFile {
                 output.write(text.getBytes(StandardCharsets.UTF_8));
                 output.flush();
             }
-            try {
-                Files.move(temporary.toPath(), target.toPath(),
-                        StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
-            } catch (AtomicMoveNotSupportedException ignored) {
-                Files.move(temporary.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING);
+            if (replaceExisting) {
+                try {
+                    Files.move(temporary.toPath(), target.toPath(),
+                            StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                } catch (AtomicMoveNotSupportedException ignored) {
+                    Files.move(temporary.toPath(), target.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                }
+            } else {
+                Files.move(temporary.toPath(), target.toPath());
             }
         } finally {
             Files.deleteIfExists(temporary.toPath());

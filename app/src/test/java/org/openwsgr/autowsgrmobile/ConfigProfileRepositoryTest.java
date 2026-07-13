@@ -6,6 +6,8 @@ import org.junit.rules.TemporaryFolder;
 
 import java.io.File;
 import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 
 import static org.junit.Assert.*;
 
@@ -61,6 +63,33 @@ public final class ConfigProfileRepositoryTest {
         }
     }
 
+    @Test public void saveAsDoesNotOverwriteTargetCreatedAfterExistenceCheck() throws Exception {
+        final File dir = temporaryFolder.newFolder("no-replace-race");
+        final File target = new File(dir, "raced.yaml");
+        ConfigProfileRepository repo = new ConfigProfileRepository(
+                dir,
+                DefaultUnifiedConfig.text(),
+                new FileActiveProfileStore(new File(dir, "active-profile.txt")),
+                new ConfigProfileValidator() {
+                    @Override public void validate(String source, String yaml) throws IOException {
+                        if ("raced.yaml".equals(source)) {
+                            Files.write(target.toPath(), "automation:\n  existing: true\n"
+                                    .getBytes(StandardCharsets.UTF_8));
+                        }
+                    }
+                }
+        );
+
+        try {
+            repo.saveAs("raced", "automation:\n  replacement: true\n", false, false);
+            fail("a target created after the existence check must not be overwritten");
+        } catch (IOException expected) {
+            // The final no-replace move must reject the concurrently created target.
+        }
+        assertEquals("automation:\n  existing: true\n",
+                new String(Files.readAllBytes(target.toPath()), StandardCharsets.UTF_8));
+    }
+
     @Test public void builtinCannotBeOverwrittenRenamedOrDeleted() throws Exception {
         ConfigProfileRepository repo = repository(temporaryFolder.newFolder("readonly"));
         assertThrows(IOException.class, () -> repo.save("builtin-safe", "automation:\n"));
@@ -68,7 +97,7 @@ public final class ConfigProfileRepositoryTest {
         assertThrows(IOException.class, () -> repo.delete("builtin-safe"));
     }
 
-    @Test public void deletedOrInvalidActiveProfileFallsBackWithoutOverwritingIt() throws Exception {
+    @Test public void deletedActiveProfileFallsBackWithoutOverwritingIt() throws Exception {
         File dir = temporaryFolder.newFolder("fallback");
         ConfigProfileRepository repo = repository(dir);
         ConfigProfile saved = repo.saveAs("broken", "automation:\n", true, false);
@@ -77,5 +106,23 @@ public final class ConfigProfileRepositoryTest {
         assertEquals("builtin-safe", result.profile.id);
         assertTrue(result.fallbackUsed);
         assertTrue(result.warning.contains("missing"));
+    }
+
+    @Test public void invalidActiveProfileFallsBackWithoutChangingProfileOrPointer() throws Exception {
+        File dir = temporaryFolder.newFolder("invalid-fallback");
+        ConfigProfileRepository repo = repository(dir);
+        ConfigProfile saved = repo.saveAs("broken", "automation:\n", true, false);
+        byte[] corruptYaml = "invalid: true\n".getBytes(StandardCharsets.UTF_8);
+        Files.write(saved.file.toPath(), corruptYaml);
+        File pointer = new File(dir, "active-profile.txt");
+        byte[] activeProfileBefore = Files.readAllBytes(pointer.toPath());
+
+        ConfigProfileRepository.LoadResult result = repository(dir).loadActive();
+
+        assertEquals("builtin-safe", result.profile.id);
+        assertTrue(result.fallbackUsed);
+        assertTrue(result.warning.contains("invalid"));
+        assertArrayEquals(corruptYaml, Files.readAllBytes(saved.file.toPath()));
+        assertArrayEquals(activeProfileBefore, Files.readAllBytes(pointer.toPath()));
     }
 }

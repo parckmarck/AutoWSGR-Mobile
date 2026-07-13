@@ -95,7 +95,11 @@ final class ConfigProfileRepository {
             throw new IOException("profile already exists: " + id);
         }
         validator.validate(id, yaml);
-        AtomicTextFile.write(file, yaml);
+        if (overwrite) {
+            AtomicTextFile.write(file, yaml);
+        } else {
+            AtomicTextFile.writeWithoutReplacing(file, yaml);
+        }
         ConfigProfile profile = new ConfigProfile(id, displayName, file, false, yaml);
         if (makeDefault) {
             activeStore.save(id);
