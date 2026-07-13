@@ -2,13 +2,7 @@ package org.openwsgr.autowsgrmobile;
 
 import android.content.Context;
 import android.graphics.Bitmap;
-import android.os.Handler;
-import android.os.Looper;
 import android.os.SystemClock;
-
-import java.io.File;
-import java.io.FileWriter;
-import java.io.IOException;
 
 final class ExpeditionCollectionRunner {
     static final String LOG_PREFIX = "auto-expedition";
@@ -22,29 +16,21 @@ final class ExpeditionCollectionRunner {
 
     private final Context appContext;
     private final AutoExpeditionConfig config;
-    private final Handler mainHandler;
-    private final Callback callback;
-    private final File baseDir;
-    private final String runId;
-    private final File logFile;
+    private final AutomationSession session;
     private final MinimumGameStateRecognizer recognizer;
     private final MinimumNormalBattleNavigator homeNavigator;
     private final ExpeditionCollectionNavigator expeditionNavigator;
     private final MainPageOverlayNavigator overlayNavigator;
 
     private Thread worker;
-    private volatile boolean cancelled;
     private boolean running;
 
-    ExpeditionCollectionRunner(Context context, AutoExpeditionConfig config, Callback callback) {
+    ExpeditionCollectionRunner(Context context, AutoExpeditionConfig config, AutomationCallback callback) {
         this.appContext = context.getApplicationContext();
         this.config = config == null ? AutoExpeditionConfig.parseText("") : config;
-        this.mainHandler = new Handler(Looper.getMainLooper());
-        this.callback = callback;
-        File external = appContext.getExternalFilesDir(null);
-        this.baseDir = external == null ? appContext.getFilesDir() : external;
-        this.runId = String.valueOf(System.currentTimeMillis());
-        this.logFile = MinimumRunLogStore.logFile(baseDir, LOG_PREFIX, runId);
+        String runId = String.valueOf(System.currentTimeMillis());
+        this.session = new AutomationSession("expedition", runId, new AutomationControl(),
+                AndroidAutomationSessionSink.create(appContext, "auto-expedition", runId), callback);
         this.recognizer = new MinimumGameStateRecognizer(appContext);
         this.homeNavigator = new MinimumNormalBattleNavigator();
         this.expeditionNavigator = new ExpeditionCollectionNavigator();
@@ -72,22 +58,24 @@ final class ExpeditionCollectionRunner {
         return "success";
     }
 
-    static boolean shouldRunFinishSideEffects(boolean running) {
-        return running;
-    }
-
     synchronized boolean start() {
         if (running) {
             return false;
         }
-        cancelled = false;
         running = true;
-        post(Update.running("自动远征：启动中", "runId=" + runId + ", "
-                + startupSummary(config), logFile.getAbsolutePath(), ""));
+        progress("自动远征：启动中", startupSummary(config));
         worker = new Thread(new Runnable() {
             @Override
             public void run() {
-                runFlow();
+                try {
+                    runFlow();
+                } catch (Throwable failure) {
+                    if (session.cancelled()) {
+                        finishCancelled();
+                    } else {
+                        finishFailed("uncaught-exception, " + failure);
+                    }
+                }
             }
         }, "AutoWSGR-expedition-collection");
         worker.setPriority(Thread.MIN_PRIORITY);
@@ -96,11 +84,19 @@ final class ExpeditionCollectionRunner {
     }
 
     synchronized void cancel() {
-        cancelled = true;
+        session.cancel();
         Thread active = worker;
         if (active != null) {
             active.interrupt();
         }
+    }
+
+    synchronized void pause() {
+        session.pause();
+    }
+
+    synchronized void resume() {
+        session.resume();
     }
 
     synchronized boolean isRunning() {
@@ -143,7 +139,7 @@ final class ExpeditionCollectionRunner {
         if (!isRunning()) {
             return;
         }
-        if (cancelled) {
+        if (session.cancelled()) {
             finishCancelled();
             return;
         }
@@ -166,7 +162,7 @@ final class ExpeditionCollectionRunner {
             return;
         }
         if (state == MinimumGameStateClassifier.State.BLOCKER) {
-            finishBlocked("initial-blocker, " + stateDetail(initial));
+            finishBlocker(initial, "initial-blocker, " + stateDetail(initial));
             return;
         }
         if (state == MinimumGameStateClassifier.State.COMBAT_PHASE) {
@@ -178,13 +174,21 @@ final class ExpeditionCollectionRunner {
 
     private MinimumGameStateRecognizer.Result advancePastStartScreen(MinimumGameStateRecognizer.Result initial) {
         int clicks = 0;
-        while (!cancelled
+        while (!session.cancelled()
                 && initial != null
                 && initial.state.state == MinimumGameStateClassifier.State.START_SCREEN) {
+            if (!session.checkpoint()) {
+                finishCancelled();
+                return null;
+            }
             if (clicks >= 2) {
                 return initial;
             }
             progress("自动远征：检测到启动页", stateDetail(initial));
+            if (!session.checkpoint()) {
+                finishCancelled();
+                return null;
+            }
             if (!homeNavigator.tapStartScreenEnter(homeCancelToken(), homeNavigatorLogger())) {
                 finishBlockedOrCancelled("tap-start-screen-enter-failed");
                 return null;
@@ -198,7 +202,11 @@ final class ExpeditionCollectionRunner {
 
     private void runFromHome(MinimumGameStateRecognizer.Result home) {
         if (!hasMainReadyNotification()) {
-            finishSuccess("collected=0, reason=no-main-notification");
+            finishNoAction("collected=0, reason=no-main-notification");
+            return;
+        }
+        if (!session.checkpoint()) {
+            finishCancelled();
             return;
         }
         if (!homeNavigator.tapHomeMap(home, homeCancelToken(), homeNavigatorLogger())) {
@@ -218,7 +226,11 @@ final class ExpeditionCollectionRunner {
 
     private void runFromMapPage() {
         if (!hasMapNotification()) {
-            if (cancelled) {
+            if (session.cancelled()) {
+                finishCancelled();
+                return;
+            }
+            if (!session.checkpoint()) {
                 finishCancelled();
                 return;
             }
@@ -226,7 +238,7 @@ final class ExpeditionCollectionRunner {
                     expeditionCancelToken(),
                     expeditionNavigatorLogger()
             );
-            String outcome = returnHomeOutcome(cancelled, true, returnedHome);
+            String outcome = returnHomeOutcome(session.cancelled(), true, returnedHome);
             if ("cancelled".equals(outcome)) {
                 finishCancelled();
                 return;
@@ -235,7 +247,11 @@ final class ExpeditionCollectionRunner {
                 finishBlocked(outcome);
                 return;
             }
-            finishSuccess("collected=0, reason=no-map-notification");
+            finishNoAction("collected=0, reason=no-map-notification");
+            return;
+        }
+        if (!session.checkpoint()) {
+            finishCancelled();
             return;
         }
         if (!expeditionNavigator.tapExpeditionPanel(expeditionCancelToken(), expeditionNavigatorLogger())) {
@@ -248,21 +264,25 @@ final class ExpeditionCollectionRunner {
     private void collectFromExpeditionPanel() {
         int collected = 0;
         int lastUnclearedSlot = -1;
-        while (!cancelled && collected < MAX_COLLECTIONS) {
+        while (!session.cancelled() && collected < MAX_COLLECTIONS) {
+            if (!session.checkpoint()) {
+                finishCancelled();
+                return;
+            }
             int slot = findReadySlot();
             if (slot < 0) {
                 if (!hasMapNotification()) {
-                    finishSuccess("collected=" + collected);
+                    finishCollected(collected, "reason=no-map-notification");
                     return;
                 }
                 slot = waitForReadySlot();
                 if (slot < 0) {
-                    if (cancelled) {
+                    if (session.cancelled()) {
                         finishCancelled();
                         return;
                     }
                     if (!hasMapNotification()) {
-                        finishSuccess("collected=" + collected);
+                        finishCollected(collected, "reason=no-map-notification");
                         return;
                     }
                     finishBlocked("expedition-ready-slot-timeout, collected=" + collected);
@@ -270,16 +290,28 @@ final class ExpeditionCollectionRunner {
                 }
             }
 
+            if (!session.checkpoint()) {
+                finishCancelled();
+                return;
+            }
             if (!expeditionNavigator.tapReadySlot(slot, expeditionCancelToken(), expeditionNavigatorLogger())) {
                 finishBlockedOrCancelled("tap-expedition-slot-" + slot + "-failed");
                 return;
             }
             SystemClock.sleep(1000L);
+            if (!session.checkpoint()) {
+                finishCancelled();
+                return;
+            }
             if (!expeditionNavigator.tapSkipResult(expeditionCancelToken(), expeditionNavigatorLogger())) {
                 finishBlockedOrCancelled("tap-expedition-skip-failed");
                 return;
             }
             SystemClock.sleep(1000L);
+            if (!session.checkpoint()) {
+                finishCancelled();
+                return;
+            }
             if (!expeditionNavigator.tapConfirm(expeditionCancelToken(), expeditionNavigatorLogger())) {
                 finishBlockedOrCancelled("tap-expedition-confirm-failed");
                 return;
@@ -287,6 +319,10 @@ final class ExpeditionCollectionRunner {
             // "继续远征 — 是否使用该编队继续远征" dialog: tap 确认 (yellow, left) to re-dispatch the same
             // fleet. This matches the original AutoWSGR collect_expedition, whose confirm_operation
             // clicks the yellow 确认 template (confirm_5_540p) and re-sends the expedition.
+            if (!session.checkpoint()) {
+                finishCancelled();
+                return;
+            }
             if (!expeditionNavigator.tapRedispatchConfirm(expeditionCancelToken(), expeditionNavigatorLogger())) {
                 finishBlockedOrCancelled("tap-expedition-redispatch-confirm-failed");
                 return;
@@ -314,7 +350,7 @@ final class ExpeditionCollectionRunner {
                 lastUnclearedSlot = slot;
             }
         }
-        if (cancelled) {
+        if (session.cancelled()) {
             finishCancelled();
             return;
         }
@@ -324,7 +360,10 @@ final class ExpeditionCollectionRunner {
     private int waitForReadySlot() {
         long started = SystemClock.elapsedRealtime();
         int polls = 0;
-        while (!cancelled && SystemClock.elapsedRealtime() - started < SLOT_REFRESH_TIMEOUT_MS) {
+        while (!session.cancelled() && SystemClock.elapsedRealtime() - started < SLOT_REFRESH_TIMEOUT_MS) {
+            if (!session.checkpoint()) {
+                return -1;
+            }
             int slot = findReadySlot();
             if (slot >= 0) {
                 progress("自动远征：检测到完成槽位", "slot=" + slot);
@@ -437,7 +476,10 @@ final class ExpeditionCollectionRunner {
     private MinimumGameStateRecognizer.Result waitForInitialState() {
         long started = SystemClock.elapsedRealtime();
         int polls = 0;
-        while (!cancelled && SystemClock.elapsedRealtime() - started < INITIAL_STATE_TIMEOUT_MS) {
+        while (!session.cancelled() && SystemClock.elapsedRealtime() - started < INITIAL_STATE_TIMEOUT_MS) {
+            if (!session.checkpoint()) {
+                return null;
+            }
             MinimumGameStateRecognizer.Result result = recognizer.recognize();
             MinimumGameStateClassifier.State state = result.state.state;
             MainOverlaySnapshot overlay = detectCurrentMainOverlay();
@@ -448,6 +490,10 @@ final class ExpeditionCollectionRunner {
                                 + ", newsNotShowChecked=" + overlay.newsNotShowChecked
                                 + ", source=autowsgr/ui/main_page/overlays.py"
                 );
+                if (!session.checkpoint()) {
+                    finishCancelled();
+                    return null;
+                }
                 if (!overlayNavigator.dismiss(
                         overlay.kind,
                         overlay.newsNotShowChecked,
@@ -506,7 +552,10 @@ final class ExpeditionCollectionRunner {
     ) {
         long started = SystemClock.elapsedRealtime();
         int polls = 0;
-        while (!cancelled && SystemClock.elapsedRealtime() - started < timeoutMs) {
+        while (!session.cancelled() && SystemClock.elapsedRealtime() - started < timeoutMs) {
+            if (!session.checkpoint()) {
+                return null;
+            }
             MinimumGameStateRecognizer.Result result = recognizer.recognize();
             MinimumGameStateClassifier.State state = result.state.state;
             if (state == wanted || state == MinimumGameStateClassifier.State.BLOCKER) {
@@ -524,7 +573,10 @@ final class ExpeditionCollectionRunner {
 
     private boolean waitForTargetForeground() {
         long started = SystemClock.elapsedRealtime();
-        while (!cancelled && SystemClock.elapsedRealtime() - started < FOREGROUND_TIMEOUT_MS) {
+        while (!session.cancelled() && SystemClock.elapsedRealtime() - started < FOREGROUND_TIMEOUT_MS) {
+            if (!session.checkpoint()) {
+                return false;
+            }
             if (TargetGameLauncher.isTargetForeground()) {
                 progress("自动远征：游戏已在前台", "package="
                         + AutoWsgrAccessibilityService.latestForegroundPackage());
@@ -537,7 +589,10 @@ final class ExpeditionCollectionRunner {
 
     private boolean waitForFreshFrameAfter(long frameCount) {
         long started = SystemClock.elapsedRealtime();
-        while (!cancelled && SystemClock.elapsedRealtime() - started < FRESH_FRAME_TIMEOUT_MS) {
+        while (!session.cancelled() && SystemClock.elapsedRealtime() - started < FRESH_FRAME_TIMEOUT_MS) {
+            if (!session.checkpoint()) {
+                return false;
+            }
             ScreenFrameStore.Snapshot snapshot = ScreenFrameStore.snapshot();
             long ageMs = Math.max(0L, System.currentTimeMillis() - snapshot.lastFrameTimeMs);
             if (snapshot.hasFrame() && (snapshot.frameCount > frameCount || ageMs < 1200L)) {
@@ -550,7 +605,7 @@ final class ExpeditionCollectionRunner {
     }
 
     private boolean isBlockedOrCancelled(MinimumGameStateRecognizer.Result result, String timeoutReason) {
-        if (cancelled) {
+        if (session.cancelled()) {
             finishCancelled();
             return true;
         }
@@ -559,14 +614,14 @@ final class ExpeditionCollectionRunner {
             return true;
         }
         if (result.state.state == MinimumGameStateClassifier.State.BLOCKER) {
-            finishBlocked("blocker-detected, " + stateDetail(result));
+            finishBlocker(result, "blocker-detected, " + stateDetail(result));
             return true;
         }
         return false;
     }
 
     private void finishBlockedOrCancelled(String reason) {
-        if (cancelled) {
+        if (session.cancelled()) {
             finishCancelled();
         } else {
             finishBlocked(reason);
@@ -574,7 +629,7 @@ final class ExpeditionCollectionRunner {
     }
 
     private void finishWaitFailure(String timeoutReason) {
-        String outcome = waitFailureOutcome(cancelled, timeoutReason);
+        String outcome = waitFailureOutcome(session.cancelled(), timeoutReason);
         if ("cancelled".equals(outcome)) {
             finishCancelled();
         } else {
@@ -594,7 +649,7 @@ final class ExpeditionCollectionRunner {
         return new MinimumNormalBattleNavigator.CancelToken() {
             @Override
             public boolean cancelled() {
-                return ExpeditionCollectionRunner.this.cancelled;
+                return session.cancelled();
             }
         };
     }
@@ -612,7 +667,7 @@ final class ExpeditionCollectionRunner {
         return new ExpeditionCollectionNavigator.CancelToken() {
             @Override
             public boolean cancelled() {
-                return ExpeditionCollectionRunner.this.cancelled;
+                return session.cancelled();
             }
         };
     }
@@ -630,7 +685,7 @@ final class ExpeditionCollectionRunner {
         return new MainPageOverlayNavigator.CancelToken() {
             @Override
             public boolean cancelled() {
-                return ExpeditionCollectionRunner.this.cancelled;
+                return session.cancelled();
             }
         };
     }
@@ -656,118 +711,51 @@ final class ExpeditionCollectionRunner {
     }
 
     private void finishBlocked(String reason) {
-        if (!beginFinish()) {
-            return;
+        finish(AutomationOutcome.BLOCKED, "自动远征：已阻断", reason, true);
+    }
+
+    private void finishBlocker(MinimumGameStateRecognizer.Result result, String reason) {
+        if (result != null && result.phase == NativeCombatPhase.DOCK_FULL) {
+            finish(AutomationOutcome.DOCK_FULL, "自动远征：船坞已满", reason, true);
+        } else {
+            finishBlocked(reason);
         }
-        FailureEvidenceStore.SaveResult evidence = FailureEvidenceStore.saveLatestFailure(baseDir, runId, LOG_PREFIX);
-        appendLog("blocked", reason + ", " + evidence.detail);
-        finish(Update.finished(
-                "自动远征：已阻断",
-                reason,
-                logFile.getAbsolutePath(),
-                evidence.saved ? evidence.file.getAbsolutePath() : ""
-        ));
     }
 
     private void finishCancelled() {
-        if (!beginFinish()) {
-            return;
-        }
-        FailureEvidenceStore.SaveResult evidence = FailureEvidenceStore.saveLatestFailure(baseDir, runId, LOG_PREFIX);
-        appendLog("cancelled", evidence.detail);
-        finish(Update.finished(
-                "自动远征：已停止",
-                "cancelled",
-                logFile.getAbsolutePath(),
-                evidence.saved ? evidence.file.getAbsolutePath() : ""
-        ));
+        finish(AutomationOutcome.CANCELLED, "自动远征：已停止", "cancelled", true);
     }
 
     private void finishSuccess(String detail) {
-        if (!beginFinish()) {
-            return;
-        }
-        appendLog("success", detail);
-        finish(Update.finished("自动远征：完成", detail, logFile.getAbsolutePath(), ""));
+        finish(AutomationOutcome.SUCCESS, "自动远征：完成", detail, false);
     }
 
-    private synchronized boolean beginFinish() {
-        if (!shouldRunFinishSideEffects(running)) {
-            return false;
+    private void finishNoAction(String detail) {
+        finish(AutomationOutcome.NO_ACTION, "自动远征：无需收取", detail, false);
+    }
+
+    private void finishCollected(int collected, String reason) {
+        String detail = "collected=" + collected + ", " + reason;
+        if (collected == 0) {
+            finishNoAction(detail);
+        } else {
+            finishSuccess(detail);
         }
+    }
+
+    private void finishFailed(String detail) {
+        finish(AutomationOutcome.FAILED, "自动远征：失败", detail, true);
+    }
+
+    private synchronized void finish(AutomationOutcome outcome, String message, String detail,
+                                     boolean saveFailure) {
         running = false;
         worker = null;
-        return true;
-    }
-
-    private void finish(Update update) {
-        post(update);
+        session.finish(outcome, message, detail, saveFailure);
     }
 
     private void progress(String status, String detail) {
-        appendLog("running", status + ", " + detail);
-        post(Update.running(status, detail, logFile.getAbsolutePath(), ""));
-    }
-
-    private void appendLog(String status, String detail) {
-        File parent = logFile.getParentFile();
-        if (parent != null) {
-            parent.mkdirs();
-        }
-        FileWriter writer = null;
-        try {
-            writer = new FileWriter(logFile, true);
-            writer.write(MinimumRunLogStore.line(runId, status, detail));
-            writer.write('\n');
-        } catch (IOException ignored) {
-        } finally {
-            if (writer != null) {
-                try {
-                    writer.close();
-                } catch (IOException ignored) {
-                }
-            }
-        }
-    }
-
-    private void post(final Update update) {
-        if (callback == null) {
-            return;
-        }
-        mainHandler.post(new Runnable() {
-            @Override
-            public void run() {
-                callback.onUpdate(update);
-            }
-        });
-    }
-
-    interface Callback {
-        void onUpdate(Update update);
-    }
-
-    static final class Update {
-        final boolean running;
-        final String status;
-        final String detail;
-        final String logPath;
-        final String screenshotPath;
-
-        private Update(boolean running, String status, String detail, String logPath, String screenshotPath) {
-            this.running = running;
-            this.status = status;
-            this.detail = detail;
-            this.logPath = logPath;
-            this.screenshotPath = screenshotPath;
-        }
-
-        static Update running(String status, String detail, String logPath, String screenshotPath) {
-            return new Update(true, status, detail, logPath, screenshotPath);
-        }
-
-        static Update finished(String status, String detail, String logPath, String screenshotPath) {
-            return new Update(false, status, detail, logPath, screenshotPath);
-        }
+        session.progress(status, detail);
     }
 
     private static final class MainOverlaySnapshot {

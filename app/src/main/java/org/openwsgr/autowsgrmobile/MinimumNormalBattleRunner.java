@@ -1,12 +1,8 @@
 package org.openwsgr.autowsgrmobile;
 
 import android.content.Context;
-import android.os.Handler;
-import android.os.Looper;
 import android.os.SystemClock;
 
-import java.io.File;
-import java.io.FileWriter;
 import java.io.IOException;
 
 final class MinimumNormalBattleRunner {
@@ -21,50 +17,39 @@ final class MinimumNormalBattleRunner {
     private static final int MAX_COMBAT_BATCHES = 2;
 
     private final Context appContext;
-    private final Handler mainHandler;
-    private final Callback callback;
-    private final File baseDir;
-    private final String runId;
-    private final File logFile;
+    private final AutomationSession session;
     private final MinimumGameStateRecognizer recognizer;
     private final MinimumNormalBattleNavigator navigator;
     private final NormalSortieRunConfig runConfig;
     private NormalSortieTarget sortieTarget;
 
     private Thread worker;
-    private volatile boolean cancelled;
     private volatile GuardedCombatRunner activeCombatRunner;
     private CombatPlanPolicy selectedPolicy;
     private boolean running;
 
-    MinimumNormalBattleRunner(Context context, Callback callback) {
+    MinimumNormalBattleRunner(Context context, AutomationCallback callback) {
         this(context, NormalSortieTarget.of(1, 1), callback);
     }
 
-    MinimumNormalBattleRunner(Context context, NormalSortieTarget sortieTarget, Callback callback) {
+    MinimumNormalBattleRunner(Context context, NormalSortieTarget sortieTarget, AutomationCallback callback) {
         this.appContext = context.getApplicationContext();
-        this.mainHandler = new Handler(Looper.getMainLooper());
-        this.callback = callback;
         this.sortieTarget = sortieTarget == null ? NormalSortieTarget.of(1, 1) : sortieTarget;
         this.runConfig = null;
-        File external = appContext.getExternalFilesDir(null);
-        this.baseDir = external == null ? appContext.getFilesDir() : external;
-        this.runId = String.valueOf(System.currentTimeMillis());
-        this.logFile = MinimumRunLogStore.logFile(baseDir, runId);
+        String runId = String.valueOf(System.currentTimeMillis());
+        this.session = new AutomationSession("normal", runId, new AutomationControl(),
+                AndroidAutomationSessionSink.create(appContext, "minimum-normal", runId), callback);
         this.recognizer = new MinimumGameStateRecognizer(appContext);
         this.navigator = new MinimumNormalBattleNavigator();
     }
 
-    MinimumNormalBattleRunner(Context context, NormalSortieRunConfig runConfig, Callback callback) {
+    MinimumNormalBattleRunner(Context context, NormalSortieRunConfig runConfig, AutomationCallback callback) {
         this.appContext = context.getApplicationContext();
-        this.mainHandler = new Handler(Looper.getMainLooper());
-        this.callback = callback;
         this.sortieTarget = NormalSortieTarget.of(1, 1);
         this.runConfig = runConfig;
-        File external = appContext.getExternalFilesDir(null);
-        this.baseDir = external == null ? appContext.getFilesDir() : external;
-        this.runId = String.valueOf(System.currentTimeMillis());
-        this.logFile = MinimumRunLogStore.logFile(baseDir, runId);
+        String runId = String.valueOf(System.currentTimeMillis());
+        this.session = new AutomationSession("normal", runId, new AutomationControl(),
+                AndroidAutomationSessionSink.create(appContext, "minimum-normal", runId), callback);
         this.recognizer = new MinimumGameStateRecognizer(appContext);
         this.navigator = new MinimumNormalBattleNavigator();
     }
@@ -73,13 +58,20 @@ final class MinimumNormalBattleRunner {
         if (running) {
             return false;
         }
-        cancelled = false;
         running = true;
-        post(Update.running("最小普通战：启动中", "runId=" + runId, logFile.getAbsolutePath(), ""));
+        progress("最小普通战：启动中", startupConfigOrTargetSummary());
         worker = new Thread(new Runnable() {
             @Override
             public void run() {
-                runFlow();
+                try {
+                    runFlow();
+                } catch (Throwable failure) {
+                    if (session.cancelled()) {
+                        finishCancelled();
+                    } else {
+                        finishFailed("uncaught-exception, " + failure);
+                    }
+                }
             }
         }, "AutoWSGR-minimum-normal-battle");
         worker.setPriority(Thread.MIN_PRIORITY);
@@ -88,7 +80,7 @@ final class MinimumNormalBattleRunner {
     }
 
     synchronized void cancel() {
-        cancelled = true;
+        session.cancel();
         GuardedCombatRunner runner = activeCombatRunner;
         if (runner != null) {
             runner.cancel();
@@ -96,6 +88,22 @@ final class MinimumNormalBattleRunner {
         Thread active = worker;
         if (active != null) {
             active.interrupt();
+        }
+    }
+
+    synchronized void pause() {
+        session.pause();
+        GuardedCombatRunner runner = activeCombatRunner;
+        if (runner != null) {
+            runner.pause();
+        }
+    }
+
+    synchronized void resume() {
+        session.resume();
+        GuardedCombatRunner runner = activeCombatRunner;
+        if (runner != null) {
+            runner.resume();
         }
     }
 
@@ -141,7 +149,7 @@ final class MinimumNormalBattleRunner {
 
         MinimumGameStateRecognizer.Result initial = waitForInitialState();
         initial = advancePastStartScreen(initial);
-        if (cancelled) {
+        if (session.cancelled()) {
             finishCancelled();
             return;
         }
@@ -165,7 +173,7 @@ final class MinimumNormalBattleRunner {
             return;
         }
         if (state == MinimumGameStateClassifier.State.BLOCKER) {
-            finishBlocked("initial-blocker, " + stateDetail(initial));
+            finishBlocker(initial, "initial-blocker, " + stateDetail(initial));
             return;
         }
         if (state == MinimumGameStateClassifier.State.HOME) {
@@ -192,13 +200,21 @@ final class MinimumNormalBattleRunner {
 
     private MinimumGameStateRecognizer.Result advancePastStartScreen(MinimumGameStateRecognizer.Result initial) {
         int clicks = 0;
-        while (!cancelled
+        while (!session.cancelled()
                 && initial != null
                 && initial.state.state == MinimumGameStateClassifier.State.START_SCREEN) {
+            if (!session.checkpoint()) {
+                finishCancelled();
+                return null;
+            }
             if (clicks >= 2) {
                 return initial;
             }
             progress("最小普通战：检测到启动页", stateDetail(initial));
+            if (!session.checkpoint()) {
+                finishCancelled();
+                return null;
+            }
             if (!navigator.tapStartScreenEnter(cancelToken(), navigatorLogger())) {
                 finishBlockedOrCancelled("tap-start-screen-enter-failed");
                 return null;
@@ -211,6 +227,10 @@ final class MinimumNormalBattleRunner {
     }
 
     private void runFromHome(MinimumGameStateRecognizer.Result home) {
+        if (!session.checkpoint()) {
+            finishCancelled();
+            return;
+        }
         if (!navigator.tapHomeMap(home, cancelToken(), navigatorLogger())) {
             finishBlockedOrCancelled("tap-home-map-failed");
             return;
@@ -227,6 +247,10 @@ final class MinimumNormalBattleRunner {
     }
 
     private void runFromMapPage() {
+        if (!session.checkpoint()) {
+            finishCancelled();
+            return;
+        }
         if (!navigator.navigateToTarget(sortieTarget, cancelToken(), navigatorLogger())) {
             finishBlockedOrCancelled("navigate-map-target-" + sortieTarget.label() + "-failed");
             return;
@@ -240,10 +264,14 @@ final class MinimumNormalBattleRunner {
             return;
         }
         if (stillMap != null && stillMap.state.state == MinimumGameStateClassifier.State.BLOCKER) {
-            finishBlocked("map-blocker, " + stateDetail(stillMap));
+            finishBlocker(stillMap, "map-blocker, " + stateDetail(stillMap));
             return;
         }
         if (!verifyMapTargetBeforeEnter(stillMap)) {
+            return;
+        }
+        if (!session.checkpoint()) {
+            finishCancelled();
             return;
         }
         if (!navigator.tapEnterSortie(sortieTarget, cancelToken(), navigatorLogger())) {
@@ -252,6 +280,10 @@ final class MinimumNormalBattleRunner {
         }
         if (!waitForBattlePreparation(8000L)) {
             progress("最小普通战：尝试当前地图起点", "enter-sortie did not reach battle preparation");
+            if (!session.checkpoint()) {
+                finishCancelled();
+                return;
+            }
             if (!navigator.tapMapStartNode(cancelToken(), navigatorLogger())) {
                 finishBlockedOrCancelled("tap-map-start-node-failed");
                 return;
@@ -268,6 +300,10 @@ final class MinimumNormalBattleRunner {
         for (MinimumBattleAdvancePolicy.Step step : MinimumBattleAdvancePolicy.steps()) {
             if (!waitForBattleAdvancePage(step.requiredPage(), BATTLE_ADVANCE_PAGE_TIMEOUT_MS)) {
                 finishBlockedOrCancelled("battle-advance-page-timeout, page=" + step.requiredPage().name());
+                return;
+            }
+            if (!session.checkpoint()) {
+                finishCancelled();
                 return;
             }
             boolean tapped;
@@ -287,10 +323,14 @@ final class MinimumNormalBattleRunner {
     }
 
     private void runCombatLoop() {
-        for (int batch = 1; batch <= MAX_COMBAT_BATCHES && !cancelled; batch++) {
+        for (int batch = 1; batch <= MAX_COMBAT_BATCHES && !session.cancelled(); batch++) {
+            if (!session.checkpoint()) {
+                finishCancelled();
+                return;
+            }
             progress("最小普通战：执行战斗", "guardedBatch=" + batch + "/" + MAX_COMBAT_BATCHES);
-            GuardedCombatRunner.Update finalUpdate = runGuardedBatch(batch);
-            if (cancelled) {
+            AutomationUpdate finalUpdate = runGuardedBatch(batch);
+            if (session.cancelled()) {
                 finishCancelled();
                 return;
             }
@@ -298,27 +338,34 @@ final class MinimumNormalBattleRunner {
                 finishBlocked("combat-batch-timeout");
                 return;
             }
-            MinimumRunOutcomePolicy.Result outcome =
-                    MinimumRunOutcomePolicy.classifyGuardedFinal(finalUpdate.status, finalUpdate.detail);
             progress("最小普通战：战斗批次结束", "batch=" + batch
-                    + ", action=" + outcome.action
-                    + ", reason=" + outcome.reason
-                    + ", status=" + finalUpdate.status);
-            if (outcome.action == MinimumRunOutcomePolicy.Action.SUCCESS) {
-                finishSuccess(outcome.reason + ", " + finalUpdate.status);
-                return;
-            }
-            if (outcome.action == MinimumRunOutcomePolicy.Action.CANCELLED) {
-                finishCancelled();
-                return;
-            }
-            if (outcome.action == MinimumRunOutcomePolicy.Action.BLOCKED) {
-                finishBlocked(outcome.reason + ", " + finalUpdate.status);
-                return;
+                    + ", outcome=" + finalUpdate.outcome
+                    + ", message=" + finalUpdate.message);
+            switch (finalUpdate.outcome) {
+                case SUCCESS:
+                    finishSuccess(finalUpdate.message + ", " + finalUpdate.detail);
+                    return;
+                case CANCELLED:
+                    finishCancelled();
+                    return;
+                case FAILED:
+                    finishFailed(finalUpdate.message + ", " + finalUpdate.detail);
+                    return;
+                case DOCK_FULL:
+                    finishDockFull(finalUpdate.message + ", " + finalUpdate.detail);
+                    return;
+                case BLOCKED:
+                    finishBlocked(finalUpdate.message + ", " + finalUpdate.detail);
+                    return;
+                case EXHAUSTED:
+                case NO_ACTION:
+                case RUNNING:
+                default:
+                    break;
             }
             SystemClock.sleep(1000L);
         }
-        if (cancelled) {
+        if (session.cancelled()) {
             finishCancelled();
             return;
         }
@@ -348,19 +395,19 @@ final class MinimumNormalBattleRunner {
         return true;
     }
 
-    private GuardedCombatRunner.Update runGuardedBatch(final int batch) {
+    private AutomationUpdate runGuardedBatch(final int batch) {
         final GuardedResult guardedResult = new GuardedResult();
         GuardedCombatRunner runner = GuardedCombatRunner.boundedLoopExecuteGuarded(
                 appContext,
                 selectedPolicy,
-                new GuardedCombatRunner.Callback() {
+                new AutomationCallback() {
                     @Override
-                    public void onUpdate(GuardedCombatRunner.Update update) {
-                        appendLog("combat", "batch=" + batch
-                                + ", status=" + update.status
+                    public void onUpdate(AutomationUpdate update) {
+                        progress("最小普通战：战斗中", "batch=" + batch
+                                + ", outcome=" + update.outcome
+                                + ", message=" + update.message
                                 + ", detail=" + update.detail);
-                        post(Update.running("最小普通战：战斗中", update.status, logFile.getAbsolutePath(), ""));
-                        if (!update.running) {
+                        if (update.outcome.terminal) {
                             guardedResult.finish(update);
                         }
                     }
@@ -371,7 +418,7 @@ final class MinimumNormalBattleRunner {
             activeCombatRunner = null;
             return null;
         }
-        GuardedCombatRunner.Update update = guardedResult.await(COMBAT_BATCH_TIMEOUT_MS);
+        AutomationUpdate update = guardedResult.await(COMBAT_BATCH_TIMEOUT_MS);
         if (activeCombatRunner == runner) {
             activeCombatRunner = null;
         }
@@ -384,7 +431,10 @@ final class MinimumNormalBattleRunner {
     private MinimumGameStateRecognizer.Result waitForInitialState() {
         long started = SystemClock.elapsedRealtime();
         int polls = 0;
-        while (!cancelled && SystemClock.elapsedRealtime() - started < INITIAL_STATE_TIMEOUT_MS) {
+        while (!session.cancelled() && SystemClock.elapsedRealtime() - started < INITIAL_STATE_TIMEOUT_MS) {
+            if (!session.checkpoint()) {
+                return null;
+            }
             MinimumGameStateRecognizer.Result result = recognizer.recognize();
             MinimumGameStateClassifier.State state = result.state.state;
             if (polls == 0 || polls % 6 == 0 || isActionable(state)) {
@@ -411,7 +461,10 @@ final class MinimumNormalBattleRunner {
     ) {
         long started = SystemClock.elapsedRealtime();
         int polls = 0;
-        while (!cancelled && SystemClock.elapsedRealtime() - started < timeoutMs) {
+        while (!session.cancelled() && SystemClock.elapsedRealtime() - started < timeoutMs) {
+            if (!session.checkpoint()) {
+                return null;
+            }
             MinimumGameStateRecognizer.Result result = recognizer.recognize();
             MinimumGameStateClassifier.State state = result.state.state;
             if (state == wanted || state == MinimumGameStateClassifier.State.BLOCKER) {
@@ -430,7 +483,10 @@ final class MinimumNormalBattleRunner {
     private boolean waitForBattlePreparation(long timeoutMs) {
         long started = SystemClock.elapsedRealtime();
         int polls = 0;
-        while (!cancelled && SystemClock.elapsedRealtime() - started < timeoutMs) {
+        while (!session.cancelled() && SystemClock.elapsedRealtime() - started < timeoutMs) {
+            if (!session.checkpoint()) {
+                return false;
+            }
             MinimumGameStateRecognizer.PageProbe probe = recognizer.battlePreparationProbe();
             if (probe.matched) {
                 progress("最小普通战：出征准备已识别", probe.detail);
@@ -449,7 +505,11 @@ final class MinimumNormalBattleRunner {
         long started = SystemClock.elapsedRealtime();
         int polls = 0;
         boolean handledNightPrompt = false;
-        while (!cancelled && SystemClock.elapsedRealtime() - started < COMBAT_PHASE_TIMEOUT_MS) {
+        while (!session.cancelled() && SystemClock.elapsedRealtime() - started < COMBAT_PHASE_TIMEOUT_MS) {
+            if (!session.checkpoint()) {
+                finishCancelled();
+                return;
+            }
             MinimumGameStateRecognizer.PageProbe nightPrompt =
                     recognizer.battleAdvancePageProbe(MinimumBattleAdvancePolicy.Page.FLEET_SUPPLY_PROMPT);
             if (nightPrompt.matched) {
@@ -472,6 +532,10 @@ final class MinimumNormalBattleRunner {
                                 + ", action=" + actionId
                                 + ", choice=" + (pursue ? "追击" : "放弃")
                                 + ", " + nightPrompt.detail);
+                if (!session.checkpoint()) {
+                    finishCancelled();
+                    return;
+                }
                 if (!navigator.tapNightPrompt(pursue, cancelToken(), navigatorLogger())) {
                     finishBlockedOrCancelled("tap-night-prompt-" + actionId + "-failed");
                     return;
@@ -490,7 +554,7 @@ final class MinimumNormalBattleRunner {
                 return;
             }
             if (state == MinimumGameStateClassifier.State.BLOCKER) {
-                finishBlocked("blocker-detected, " + stateDetail(result));
+                finishBlocker(result, "blocker-detected, " + stateDetail(result));
                 return;
             }
             if (polls == 0 || polls % 8 == 0) {
@@ -500,7 +564,7 @@ final class MinimumNormalBattleRunner {
             polls++;
             SystemClock.sleep(700L);
         }
-        if (cancelled) {
+        if (session.cancelled()) {
             finishCancelled();
             return;
         }
@@ -554,7 +618,7 @@ final class MinimumNormalBattleRunner {
             sortieTarget = policy.normalTarget();
             return policy;
         } catch (IOException e) {
-            appendLog("blocked", "selected-plan-load-failed, "
+            progress("最小普通战：加载方案失败", "selected-plan-load-failed, "
                     + startupConfigOrTargetSummary() + ", reason=" + e.getMessage());
             return null;
         }
@@ -573,7 +637,10 @@ final class MinimumNormalBattleRunner {
     ) {
         long started = SystemClock.elapsedRealtime();
         int polls = 0;
-        while (!cancelled && SystemClock.elapsedRealtime() - started < timeoutMs) {
+        while (!session.cancelled() && SystemClock.elapsedRealtime() - started < timeoutMs) {
+            if (!session.checkpoint()) {
+                return false;
+            }
             MinimumGameStateRecognizer.PageProbe probe = recognizer.battleAdvancePageProbe(page);
             if (probe.matched) {
                 progress("最小普通战：确认" + page.label(), probe.detail);
@@ -590,7 +657,10 @@ final class MinimumNormalBattleRunner {
 
     private boolean waitForTargetForeground() {
         long started = SystemClock.elapsedRealtime();
-        while (!cancelled && SystemClock.elapsedRealtime() - started < FOREGROUND_TIMEOUT_MS) {
+        while (!session.cancelled() && SystemClock.elapsedRealtime() - started < FOREGROUND_TIMEOUT_MS) {
+            if (!session.checkpoint()) {
+                return false;
+            }
             if (TargetGameLauncher.isTargetForeground()) {
                 progress("最小普通战：游戏已在前台", "package="
                         + AutoWsgrAccessibilityService.latestForegroundPackage());
@@ -603,7 +673,10 @@ final class MinimumNormalBattleRunner {
 
     private boolean waitForFreshFrameAfter(long frameCount) {
         long started = SystemClock.elapsedRealtime();
-        while (!cancelled && SystemClock.elapsedRealtime() - started < FRESH_FRAME_TIMEOUT_MS) {
+        while (!session.cancelled() && SystemClock.elapsedRealtime() - started < FRESH_FRAME_TIMEOUT_MS) {
+            if (!session.checkpoint()) {
+                return false;
+            }
             ScreenFrameStore.Snapshot snapshot = ScreenFrameStore.snapshot();
             long ageMs = Math.max(0L, System.currentTimeMillis() - snapshot.lastFrameTimeMs);
             if (snapshot.hasFrame() && (snapshot.frameCount > frameCount || ageMs < 1200L)) {
@@ -616,7 +689,7 @@ final class MinimumNormalBattleRunner {
     }
 
     private boolean isBlockedOrCancelled(MinimumGameStateRecognizer.Result result, String timeoutReason) {
-        if (cancelled) {
+        if (session.cancelled()) {
             finishCancelled();
             return true;
         }
@@ -625,14 +698,14 @@ final class MinimumNormalBattleRunner {
             return true;
         }
         if (result.state.state == MinimumGameStateClassifier.State.BLOCKER) {
-            finishBlocked("blocker-detected, " + stateDetail(result));
+            finishBlocker(result, "blocker-detected, " + stateDetail(result));
             return true;
         }
         return false;
     }
 
     private void finishBlockedOrCancelled(String reason) {
-        if (cancelled) {
+        if (session.cancelled()) {
             finishCancelled();
         } else {
             finishBlocked(reason);
@@ -651,7 +724,7 @@ final class MinimumNormalBattleRunner {
         return new MinimumNormalBattleNavigator.CancelToken() {
             @Override
             public boolean cancelled() {
-                return MinimumNormalBattleRunner.this.cancelled;
+                return session.cancelled();
             }
         };
     }
@@ -677,122 +750,73 @@ final class MinimumNormalBattleRunner {
     }
 
     private void finishBlocked(String reason) {
-        FailureEvidenceStore.SaveResult evidence = FailureEvidenceStore.saveLatestFailure(baseDir, runId);
-        appendLog("blocked", reason + ", " + evidence.detail);
-        finish(Update.finished(
-                "最小普通战：已阻断",
-                reason,
-                logFile.getAbsolutePath(),
-                evidence.saved ? evidence.file.getAbsolutePath() : ""
-        ));
+        finish(AutomationOutcome.BLOCKED, "最小普通战：已阻断", reason, true);
+    }
+
+    private void finishBlocker(MinimumGameStateRecognizer.Result result, String reason) {
+        if (result != null && result.phase == NativeCombatPhase.DOCK_FULL) {
+            finishDockFull(reason);
+        } else {
+            finishBlocked(reason);
+        }
+    }
+
+    private void finishDockFull(String reason) {
+        finish(AutomationOutcome.DOCK_FULL, "最小普通战：船坞已满", reason, true);
     }
 
     private void finishCancelled() {
-        FailureEvidenceStore.SaveResult evidence = FailureEvidenceStore.saveLatestFailure(baseDir, runId);
-        appendLog("cancelled", evidence.detail);
-        finish(Update.finished(
-                "最小普通战：已停止",
-                "cancelled",
-                logFile.getAbsolutePath(),
-                evidence.saved ? evidence.file.getAbsolutePath() : ""
-        ));
+        finish(AutomationOutcome.CANCELLED, "最小普通战：已停止", "cancelled", true);
     }
 
     private void finishSuccess(String detail) {
-        appendLog("success", detail);
-        finish(Update.finished("最小普通战：完成", detail, logFile.getAbsolutePath(), ""));
+        finish(AutomationOutcome.SUCCESS, "最小普通战：完成", detail, false);
     }
 
-    private synchronized void finish(Update update) {
+    private void finishFailed(String detail) {
+        finish(AutomationOutcome.FAILED, "最小普通战：失败", detail, true);
+    }
+
+    private synchronized void finish(AutomationOutcome outcome, String message, String detail,
+                                     boolean saveFailure) {
         running = false;
         activeCombatRunner = null;
-        post(update);
+        session.finish(outcome, message, detail, saveFailure);
     }
 
     private void progress(String status, String detail) {
-        appendLog("running", status + ", " + detail);
-        post(Update.running(status, detail, logFile.getAbsolutePath(), ""));
-    }
-
-    private void appendLog(String status, String detail) {
-        File parent = logFile.getParentFile();
-        if (parent != null) {
-            parent.mkdirs();
-        }
-        FileWriter writer = null;
-        try {
-            writer = new FileWriter(logFile, true);
-            writer.write(MinimumRunLogStore.line(runId, status, detail));
-            writer.write('\n');
-        } catch (IOException ignored) {
-        } finally {
-            if (writer != null) {
-                try {
-                    writer.close();
-                } catch (IOException ignored) {
-                }
-            }
-        }
-    }
-
-    private void post(final Update update) {
-        mainHandler.post(new Runnable() {
-            @Override
-            public void run() {
-                callback.onUpdate(update);
-            }
-        });
-    }
-
-    interface Callback {
-        void onUpdate(Update update);
-    }
-
-    static final class Update {
-        final boolean running;
-        final String status;
-        final String detail;
-        final String logPath;
-        final String screenshotPath;
-
-        private Update(boolean running, String status, String detail, String logPath, String screenshotPath) {
-            this.running = running;
-            this.status = status;
-            this.detail = detail;
-            this.logPath = logPath;
-            this.screenshotPath = screenshotPath;
-        }
-
-        static Update running(String status, String detail, String logPath, String screenshotPath) {
-            return new Update(true, status, detail, logPath, screenshotPath);
-        }
-
-        static Update finished(String status, String detail, String logPath, String screenshotPath) {
-            return new Update(false, status, detail, logPath, screenshotPath);
-        }
+        session.progress(status, detail);
     }
 
     private final class GuardedResult {
-        private GuardedCombatRunner.Update update;
+        private volatile AutomationUpdate update;
 
-        synchronized GuardedCombatRunner.Update await(long timeoutMs) {
+        AutomationUpdate await(long timeoutMs) {
             long deadline = SystemClock.elapsedRealtime() + timeoutMs;
-            while (update == null && !cancelled) {
+            while (!session.cancelled()) {
+                if (!session.checkpoint()) {
+                    return null;
+                }
                 long remaining = deadline - SystemClock.elapsedRealtime();
                 if (remaining <= 0L) {
                     return null;
                 }
-                try {
-                    wait(Math.min(remaining, 1000L));
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return null;
+                synchronized (this) {
+                    if (update != null) {
+                        return update;
+                    }
+                    try {
+                        wait(Math.min(remaining, 1000L));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return null;
+                    }
                 }
             }
             return update;
         }
 
-        synchronized void finish(GuardedCombatRunner.Update update) {
+        synchronized void finish(AutomationUpdate update) {
             this.update = update;
             notifyAll();
         }

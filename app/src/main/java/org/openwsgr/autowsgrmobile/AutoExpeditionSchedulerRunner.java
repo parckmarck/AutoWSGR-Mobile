@@ -1,8 +1,6 @@
 package org.openwsgr.autowsgrmobile;
 
 import android.content.Context;
-import android.os.Handler;
-import android.os.Looper;
 import android.os.SystemClock;
 
 final class AutoExpeditionSchedulerRunner {
@@ -13,19 +11,19 @@ final class AutoExpeditionSchedulerRunner {
 
     private final Context appContext;
     private final AutoExpeditionConfig config;
-    private final Handler mainHandler;
-    private final Callback callback;
+    private final AutomationSession session;
 
     private Thread worker;
-    private volatile boolean cancelled;
     private volatile ExpeditionCollectionRunner activePass;
     private boolean running;
 
-    AutoExpeditionSchedulerRunner(Context context, AutoExpeditionConfig config, Callback callback) {
+    AutoExpeditionSchedulerRunner(Context context, AutoExpeditionConfig config,
+                                  AutomationCallback callback) {
         this.appContext = context.getApplicationContext();
         this.config = config == null ? AutoExpeditionConfig.parseText("") : config;
-        this.mainHandler = new Handler(Looper.getMainLooper());
-        this.callback = callback;
+        String runId = String.valueOf(System.currentTimeMillis());
+        this.session = new AutomationSession("expedition", runId, new AutomationControl(),
+                AndroidAutomationSessionSink.create(appContext, "auto-expedition", runId), callback);
     }
 
     static String startupSummary(AutoExpeditionConfig config) {
@@ -33,10 +31,6 @@ final class AutoExpeditionSchedulerRunner {
         return "interval_seconds=" + safe.intervalSeconds
                 + ", app_scoped=true"
                 + ", collect_only=false";
-    }
-
-    static boolean shouldBlockNewFlowForAutoExpedition(boolean autoRunning) {
-        return autoRunning;
     }
 
     static PassWaitDecision passWaitDecision(boolean passRunning, long startMs, long nowMs) {
@@ -58,51 +52,18 @@ final class AutoExpeditionSchedulerRunner {
         );
     }
 
-    static ExpeditionCollectionRunner.Update forwardedPassUpdate(ExpeditionCollectionRunner.Update update) {
-        if (update == null) {
-            return ExpeditionCollectionRunner.Update.running(
-                    "自动远征：等待下次检查",
-                    "pass_final_status=unknown, pass_final_detail=",
-                    "",
-                    ""
-            );
-        }
-        if (update.running) {
-            return update;
-        }
-        return ExpeditionCollectionRunner.Update.running(
-                "自动远征：等待下次检查",
-                "pass_final_status=" + update.status + ", pass_final_detail=" + update.detail,
-                update.logPath,
-                update.screenshotPath
-        );
-    }
-
-    static ExpeditionCollectionRunner.Update waitUpdate(
-            String reason,
-            long remainingMs,
-            AutoExpeditionConfig config,
-            String latestLogPath,
-            String latestScreenshotPath
-    ) {
-        return ExpeditionCollectionRunner.Update.running(
-                "自动远征：等待下次检查",
-                "reason=" + reason + ", wait_ms=" + Math.max(0L, remainingMs) + ", " + startupSummary(config),
-                latestLogPath == null ? "" : latestLogPath,
-                latestScreenshotPath == null ? "" : latestScreenshotPath
-        );
-    }
-
-    static ExpeditionCollectionRunner.Update stopUpdate(
-            String detail,
-            String latestLogPath,
-            String latestScreenshotPath
-    ) {
-        return ExpeditionCollectionRunner.Update.finished(
-                "自动远征：已停止",
-                detail,
-                latestLogPath == null ? "" : latestLogPath,
-                latestScreenshotPath == null ? "" : latestScreenshotPath
+    static AutomationUpdate forwardedPassUpdate(AutomationUpdate update, String schedulerRunId,
+                                                 String schedulerLogPath) {
+        String message = update == null || update.outcome.terminal
+                ? "自动远征：等待下次检查"
+                : update.message;
+        String detail = update == null
+                ? "pass_final_outcome=unknown, pass_final_message=, pass_final_detail="
+                : "pass_outcome=" + update.outcome
+                + ", pass_message=" + update.message
+                + ", pass_detail=" + update.detail;
+        return AutomationUpdate.progress(
+                "expedition", schedulerRunId, message, detail, schedulerLogPath, ""
         );
     }
 
@@ -110,21 +71,19 @@ final class AutoExpeditionSchedulerRunner {
         if (running) {
             return false;
         }
-        cancelled = false;
-        if (!config.enabled()) {
-            post(ExpeditionCollectionRunner.Update.finished(
-                    "自动远征：已禁用",
-                    startupSummary(config),
-                    "",
-                    ""
-            ));
-            return false;
-        }
         running = true;
         worker = new Thread(new Runnable() {
-            @Override
-            public void run() {
-                runLoop();
+            @Override public void run() {
+                try {
+                    runLoop();
+                } catch (Throwable failure) {
+                    if (session.cancelled()) {
+                        finishCancelled();
+                    } else {
+                        finish(AutomationOutcome.FAILED, "自动远征：失败",
+                                "uncaught-exception, " + failure, true);
+                    }
+                }
             }
         }, "AutoWSGR-auto-expedition");
         worker.setPriority(Thread.MIN_PRIORITY);
@@ -133,7 +92,7 @@ final class AutoExpeditionSchedulerRunner {
     }
 
     void cancel() {
-        cancelled = true;
+        session.cancel();
         ExpeditionCollectionRunner pass = activePass;
         if (pass != null) {
             pass.cancel();
@@ -147,23 +106,40 @@ final class AutoExpeditionSchedulerRunner {
         }
     }
 
+    void pause() {
+        session.pause();
+        ExpeditionCollectionRunner pass = activePass;
+        if (pass != null) {
+            pass.pause();
+        }
+    }
+
+    void resume() {
+        session.resume();
+        ExpeditionCollectionRunner pass = activePass;
+        if (pass != null) {
+            pass.resume();
+        }
+    }
+
     synchronized boolean isRunning() {
         return running;
     }
 
     private void runLoop() {
-        post(ExpeditionCollectionRunner.Update.running(
-                "自动远征：启动中",
-                startupSummary(config),
-                "",
-                ""
-        ));
+        progress("自动远征：启动中", startupSummary(config));
+        if (!config.enabled()) {
+            finish(AutomationOutcome.NO_ACTION, "自动远征：已禁用", startupSummary(config), false);
+            return;
+        }
 
         boolean firstPassCompleted = false;
         long lastAttemptMs = 0L;
-        String latestLogPath = "";
-        String latestScreenshotPath = "";
-        while (!cancelled) {
+        while (!session.cancelled()) {
+            if (!session.checkpoint()) {
+                finishCancelled();
+                return;
+            }
             AutoExpeditionSchedulerPolicy.Decision decision = AutoExpeditionSchedulerPolicy.decide(
                     firstPassCompleted,
                     activePass != null,
@@ -172,11 +148,11 @@ final class AutoExpeditionSchedulerRunner {
                     config.intervalSeconds
             );
             if (decision.action == AutoExpeditionSchedulerPolicy.Action.DISABLED) {
-                finish("自动远征：已禁用", decision.detail, "", "");
+                finish(AutomationOutcome.NO_ACTION, "自动远征：已禁用", decision.detail, false);
                 return;
             }
             if (decision.action == AutoExpeditionSchedulerPolicy.Action.WAIT) {
-                sleepForWait(decision.waitMs, decision.detail, latestLogPath, latestScreenshotPath);
+                sleepForWait(decision.waitMs, decision.detail);
                 continue;
             }
 
@@ -188,55 +164,57 @@ final class AutoExpeditionSchedulerRunner {
                     passCallback(monitor)
             );
             activePass = pass;
+            if (!session.checkpoint()) {
+                activePass = null;
+                finishCancelled();
+                return;
+            }
             if (!pass.start()) {
                 activePass = null;
-                sleepForWait(WAIT_CHUNK_MS, "pass-start-skipped", latestLogPath, latestScreenshotPath);
+                sleepForWait(WAIT_CHUNK_MS, "pass-start-skipped");
                 continue;
             }
-            ExpeditionCollectionRunner.Update finalUpdate = monitor.awaitFinal(lastAttemptMs);
-            if (finalUpdate == null && !cancelled) {
+            AutomationUpdate finalUpdate = monitor.awaitFinal(lastAttemptMs);
+            if (finalUpdate == null && !session.cancelled()) {
                 pass.cancel();
-                post(ExpeditionCollectionRunner.Update.running(
-                        "自动远征：本轮超时",
-                        "pass-timeout, max_ms=" + MAX_PASS_WAIT_MS + ", " + startupSummary(config),
-                        "",
-                        ""
-                ));
+                progress("自动远征：本轮超时",
+                        "pass-timeout, max_ms=" + MAX_PASS_WAIT_MS + ", " + startupSummary(config));
             }
             activePass = null;
-            if (finalUpdate != null) {
-                latestLogPath = finalUpdate.logPath == null ? "" : finalUpdate.logPath;
-                latestScreenshotPath = finalUpdate.screenshotPath == null ? "" : finalUpdate.screenshotPath;
+            if (finalUpdate != null && finalUpdate.outcome == AutomationOutcome.FAILED) {
+                finish(AutomationOutcome.FAILED, "自动远征：本轮失败",
+                        "pass_message=" + finalUpdate.message + ", pass_detail=" + finalUpdate.detail,
+                        true);
+                return;
             }
             firstPassCompleted = true;
         }
-        finish(stopUpdate("cancelled", latestLogPath, latestScreenshotPath));
+        finishCancelled();
     }
 
-    private ExpeditionCollectionRunner.Callback passCallback(final PassMonitor monitor) {
-        return new ExpeditionCollectionRunner.Callback() {
-            @Override
-            public void onUpdate(ExpeditionCollectionRunner.Update update) {
-                post(forwardedPassUpdate(update));
-                if (update != null && !update.running) {
+    private AutomationCallback passCallback(final PassMonitor monitor) {
+        return new AutomationCallback() {
+            @Override public void onUpdate(AutomationUpdate update) {
+                AutomationUpdate forwarded = forwardedPassUpdate(update, "", "");
+                progress(forwarded.message, forwarded.detail);
+                if (update.outcome.terminal) {
                     monitor.finish(update);
                 }
             }
         };
     }
 
-    private void sleepForWait(
-            long waitMs,
-            String reason,
-            String latestLogPath,
-            String latestScreenshotPath
-    ) {
+    private void sleepForWait(long waitMs, String reason) {
         long remainingMs = Math.max(0L, waitMs);
         long nextStatusMs = SystemClock.elapsedRealtime();
-        while (!cancelled && remainingMs > 0L) {
+        while (!session.cancelled() && remainingMs > 0L) {
+            if (!session.checkpoint()) {
+                return;
+            }
             long nowMs = SystemClock.elapsedRealtime();
             if (nowMs >= nextStatusMs) {
-                post(waitUpdate(reason, remainingMs, config, latestLogPath, latestScreenshotPath));
+                progress("自动远征：等待下次检查",
+                        "reason=" + reason + ", wait_ms=" + remainingMs + ", " + startupSummary(config));
                 nextStatusMs = nowMs + WAIT_STATUS_INTERVAL_MS;
             }
             long chunkMs = Math.min(WAIT_CHUNK_MS, remainingMs);
@@ -245,61 +223,56 @@ final class AutoExpeditionSchedulerRunner {
         }
     }
 
-    private void finish(String status, String detail, String logPath, String screenshotPath) {
-        finish(ExpeditionCollectionRunner.Update.finished(status, detail, logPath, screenshotPath));
+    private void finishCancelled() {
+        finish(AutomationOutcome.CANCELLED, "自动远征：已停止", "cancelled", false);
     }
 
-    private void finish(ExpeditionCollectionRunner.Update update) {
-        synchronized (this) {
-            if (!running) {
-                return;
-            }
-            running = false;
-            worker = null;
-        }
+    private synchronized void finish(AutomationOutcome outcome, String message, String detail,
+                                     boolean saveFailure) {
+        running = false;
+        worker = null;
         activePass = null;
-        post(update);
+        session.finish(outcome, message, detail, saveFailure);
     }
 
-    private void post(final ExpeditionCollectionRunner.Update update) {
-        if (callback == null) {
-            return;
-        }
-        mainHandler.post(new Runnable() {
-            @Override
-            public void run() {
-                callback.onUpdate(update);
-            }
-        });
-    }
-
-    interface Callback {
-        void onUpdate(ExpeditionCollectionRunner.Update update);
+    private void progress(String message, String detail) {
+        session.progress(message, detail);
     }
 
     private final class PassMonitor {
-        private ExpeditionCollectionRunner.Update finalUpdate;
+        private volatile AutomationUpdate finalUpdate;
 
-        synchronized void finish(ExpeditionCollectionRunner.Update update) {
+        synchronized void finish(AutomationUpdate update) {
             finalUpdate = update;
             notifyAll();
         }
 
-        synchronized ExpeditionCollectionRunner.Update awaitFinal() {
+        AutomationUpdate awaitFinal() {
             return awaitFinal(SystemClock.elapsedRealtime());
         }
 
-        synchronized ExpeditionCollectionRunner.Update awaitFinal(long startMs) {
-            while (!cancelled) {
-                PassWaitDecision decision = passWaitDecision(finalUpdate == null, startMs, SystemClock.elapsedRealtime());
-                if (decision.action == PassWaitAction.DONE || decision.action == PassWaitAction.TIMEOUT) {
+        AutomationUpdate awaitFinal(long startMs) {
+            while (!session.cancelled()) {
+                if (!session.checkpoint()) {
                     return finalUpdate;
                 }
-                try {
-                    wait(decision.waitMs);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    break;
+                PassWaitDecision decision = passWaitDecision(
+                        finalUpdate == null, startMs, SystemClock.elapsedRealtime()
+                );
+                if (decision.action == PassWaitAction.DONE
+                        || decision.action == PassWaitAction.TIMEOUT) {
+                    return finalUpdate;
+                }
+                synchronized (this) {
+                    if (finalUpdate != null) {
+                        return finalUpdate;
+                    }
+                    try {
+                        wait(decision.waitMs);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        break;
+                    }
                 }
             }
             return finalUpdate;

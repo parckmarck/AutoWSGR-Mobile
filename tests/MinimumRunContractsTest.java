@@ -4,6 +4,9 @@ import org.openwsgr.autowsgrmobile.vision.PixelRule;
 import org.openwsgr.autowsgrmobile.vision.PixelSignature;
 
 import java.io.File;
+import java.io.IOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
 import java.util.Arrays;
 import java.util.List;
 
@@ -87,12 +90,12 @@ final class MinimumRunContractsTest {
         expeditionRunnerSummaryMentionsCollectOnlySemantics();
         expeditionRunnerWaitFailurePrefersCancelledOverBlocked();
         expeditionRunnerReturnHomeOutcomeDoesNotReportSuccessAfterCancelOrTapFailure();
-        expeditionRunnerFinishGuardPreventsDuplicateSideEffects();
+        expeditionRunnerUsesSessionOwnedFinalization();
         autoExpeditionSchedulerSummaryUsesOriginalInterval();
         autoExpeditionSchedulerBoundsPassWaits();
         autoExpeditionSchedulerForwardsPassFinalAsRunningUntilSchedulerStops();
         autoExpeditionSchedulerWaitAndStopPreserveLatestEvidencePaths();
-        autoExpeditionBlocksOtherFlowStarts();
+        autoExpeditionUsesRuntimeGlobalGate();
         expeditionSlotReadyVerificationHelperMatchesFindReadySlot();
         expeditionReadySlotDetectorToleratesSmallSpatialDrift();
         campaignCatalogMapsNamesToOriginalIndexAndDifficulty();
@@ -102,6 +105,11 @@ final class MinimumRunContractsTest {
         campaignBattleConfigBuildsSingleNodePlanWithFormationAndNight();
         campaignNavigatorTapTargetsMatchOriginal();
         digitTemplateRecognizerMatchesSyntheticDigits();
+        migratedRunnersPublishTypedTerminalOutcomes();
+        migratedRunnersDelegateControlAndCheckpointActions();
+        schedulerKeepsPassTerminalsRunningUntilSchedulerStops();
+        mainActivityUsesApplicationRuntimeWithoutPairwiseFlowMatrix();
+        mainActivityLifecycleReplaysWithoutDestroyCancellation();
     }
 
     private static void preflightBlocksMissingFrame() {
@@ -1525,15 +1533,11 @@ final class MinimumRunContractsTest {
         assertEquals("success", ExpeditionCollectionRunner.returnHomeOutcome(false, true, true));
     }
 
-    private static void expeditionRunnerFinishGuardPreventsDuplicateSideEffects() {
-        assertTrue(
-                ExpeditionCollectionRunner.shouldRunFinishSideEffects(true),
-                "first finish should save evidence and log"
-        );
-        assertFalse(
-                ExpeditionCollectionRunner.shouldRunFinishSideEffects(false),
-                "duplicate finish must not save evidence or log"
-        );
+    private static void expeditionRunnerUsesSessionOwnedFinalization() {
+        String source = productionSource("ExpeditionCollectionRunner.java");
+        assertContains(source, "private final AutomationSession session;");
+        assertNotContains(source, "shouldRunFinishSideEffects");
+        assertNotContains(source, "private boolean finished;");
     }
 
     private static void autoExpeditionSchedulerSummaryUsesOriginalInterval() {
@@ -1554,48 +1558,37 @@ final class MinimumRunContractsTest {
     }
 
     private static void autoExpeditionSchedulerForwardsPassFinalAsRunningUntilSchedulerStops() {
-        ExpeditionCollectionRunner.Update passFinal = ExpeditionCollectionRunner.Update.finished(
+        AutomationUpdate passFinal = AutomationUpdate.terminal(
+                "expedition",
+                "pass-1",
+                AutomationOutcome.SUCCESS,
                 "自动远征：完成",
                 "collected=0",
                 "log",
                 ""
         );
-        ExpeditionCollectionRunner.Update forwarded = AutoExpeditionSchedulerRunner.forwardedPassUpdate(passFinal);
-        assertTrue(forwarded.running, "scheduler should remain running after one pass final update");
-        assertContains(forwarded.status, "自动远征：等待下次检查");
+        AutomationUpdate forwarded = AutoExpeditionSchedulerRunner.forwardedPassUpdate(
+                passFinal,
+                "scheduler-1",
+                "scheduler.log"
+        );
+        assertEquals(AutomationOutcome.RUNNING, forwarded.outcome);
+        assertContains(forwarded.message, "自动远征：等待下次检查");
         assertContains(forwarded.detail, "自动远征：完成");
     }
 
     private static void autoExpeditionSchedulerWaitAndStopPreserveLatestEvidencePaths() {
-        AutoExpeditionConfig config = AutoExpeditionConfig.parseText("interval_seconds: 900\n");
-        ExpeditionCollectionRunner.Update wait = AutoExpeditionSchedulerRunner.waitUpdate(
-                "interval-wait",
-                1234L,
-                config,
-                "/runs/auto-expedition.log",
-                "/failures/auto-expedition.png"
-        );
-        assertEquals("/runs/auto-expedition.log", wait.logPath);
-        assertEquals("/failures/auto-expedition.png", wait.screenshotPath);
-
-        ExpeditionCollectionRunner.Update stopped = AutoExpeditionSchedulerRunner.stopUpdate(
-                "cancelled",
-                "/runs/auto-expedition.log",
-                "/failures/auto-expedition.png"
-        );
-        assertEquals("/runs/auto-expedition.log", stopped.logPath);
-        assertEquals("/failures/auto-expedition.png", stopped.screenshotPath);
+        String source = productionSource("AutoExpeditionSchedulerRunner.java");
+        assertContains(source, "private final AutomationSession session;");
+        assertContains(source, "AndroidAutomationSessionSink.create(appContext, \"auto-expedition\", runId)");
+        assertNotContains(source, "latestLogPath");
+        assertNotContains(source, "latestScreenshotPath");
     }
 
-    private static void autoExpeditionBlocksOtherFlowStarts() {
-        assertTrue(
-                AutoExpeditionSchedulerRunner.shouldBlockNewFlowForAutoExpedition(true),
-                "auto expedition running should block other flow starts"
-        );
-        assertFalse(
-                AutoExpeditionSchedulerRunner.shouldBlockNewFlowForAutoExpedition(false),
-                "auto expedition stopped should not block other flow starts"
-        );
+    private static void autoExpeditionUsesRuntimeGlobalGate() {
+        String source = productionSource("MainActivity.java");
+        assertContains(source, "runtime.start(flow)");
+        assertNotContains(source, "shouldBlockNewFlowForAutoExpedition");
     }
 
     private static void expeditionSlotReadyVerificationHelperMatchesFindReadySlot() {
@@ -1811,6 +1804,157 @@ final class MinimumRunContractsTest {
                 "identical grids should score ~1.0");
     }
 
+    private static void migratedRunnersPublishTypedTerminalOutcomes() {
+        String normal = productionSource("MinimumNormalBattleRunner.java");
+        assertSessionMigration(normal, "normal", "minimum-normal");
+        assertContains(normal, "AutomationOutcome.SUCCESS");
+        assertContains(normal, "AutomationOutcome.DOCK_FULL");
+        assertContains(normal, "AutomationOutcome.BLOCKED");
+        assertContains(normal, "AutomationOutcome.CANCELLED");
+        assertContains(normal, "AutomationOutcome.FAILED");
+
+        String expedition = productionSource("ExpeditionCollectionRunner.java");
+        assertSessionMigration(expedition, "expedition", "auto-expedition");
+        assertContains(expedition, "AutomationOutcome.NO_ACTION");
+        assertContains(expedition, "AutomationOutcome.SUCCESS");
+        assertContains(expedition, "AutomationOutcome.BLOCKED");
+        assertContains(expedition, "AutomationOutcome.CANCELLED");
+        assertContains(expedition, "AutomationOutcome.FAILED");
+
+        String scheduler = productionSource("AutoExpeditionSchedulerRunner.java");
+        assertSessionMigration(scheduler, "expedition", "auto-expedition");
+        assertContains(scheduler, "AutomationOutcome.NO_ACTION");
+        assertContains(scheduler, "AutomationOutcome.CANCELLED");
+        assertContains(scheduler, "AutomationOutcome.FAILED");
+
+        String campaign = productionSource("CampaignBattleRunner.java");
+        assertSessionMigration(campaign, "campaign", "campaign-battle");
+        assertContains(campaign, "AutomationOutcome.SUCCESS");
+        assertContains(campaign, "AutomationOutcome.EXHAUSTED");
+        assertContains(campaign, "AutomationOutcome.DOCK_FULL");
+        assertContains(campaign, "AutomationOutcome.BLOCKED");
+        assertContains(campaign, "AutomationOutcome.CANCELLED");
+        assertContains(campaign, "AutomationOutcome.FAILED");
+
+        String guarded = productionSource("GuardedCombatRunner.java");
+        assertSessionMigration(guarded, "guarded", "guarded-combat");
+        assertContains(guarded, "AutomationOutcome.SUCCESS");
+        assertContains(guarded, "AutomationOutcome.EXHAUSTED");
+        assertContains(guarded, "AutomationOutcome.BLOCKED");
+        assertContains(guarded, "AutomationOutcome.CANCELLED");
+        assertContains(guarded, "AutomationOutcome.FAILED");
+        assertNotContains(guarded, "status.contains(");
+        assertNotContains(guarded, "stepperStatus.contains(");
+    }
+
+    private static void migratedRunnersDelegateControlAndCheckpointActions() {
+        for (String name : new String[]{
+                "MinimumNormalBattleRunner.java",
+                "ExpeditionCollectionRunner.java",
+                "AutoExpeditionSchedulerRunner.java",
+                "CampaignBattleRunner.java",
+                "GuardedCombatRunner.java"
+        }) {
+            String source = productionSource(name);
+            assertContains(source, "void pause()");
+            assertContains(source, "session.pause()");
+            assertContains(source, "void resume()");
+            assertContains(source, "session.resume()");
+            assertContains(source, "session.cancel()");
+            assertContains(source, "session.checkpoint()");
+        }
+
+        String stepper = productionSource("GuardedCombatStepper.java");
+        assertContains(stepper, "enum StepOutcome");
+        assertContains(stepper, "control.checkpoint()");
+        assertContains(stepper, "void pause()");
+        assertContains(stepper, "void resume()");
+        assertContains(stepper, "control.cancel()");
+    }
+
+    private static void schedulerKeepsPassTerminalsRunningUntilSchedulerStops() {
+        String source = productionSource("AutoExpeditionSchedulerRunner.java");
+        assertContains(source, "AutomationUpdate forwardedPassUpdate(AutomationUpdate update");
+        assertContains(source, "AutomationUpdate.progress(");
+        assertContains(source, "if (update.outcome.terminal)");
+        assertNotContains(source, "session.finish(update.outcome");
+    }
+
+    private static void mainActivityUsesApplicationRuntimeWithoutPairwiseFlowMatrix() {
+        String source = productionSource("MainActivity.java");
+        assertContains(source, "((AutoWsgrApplication) getApplication()).automationRuntime()");
+        assertNotContains(source, "new AutomationCoordinator(");
+        assertContains(source, "runtime.start(flow)");
+        assertContains(source, "正在运行：");
+        assertContains(source, "暂停当前流程");
+        assertContains(source, "继续当前流程");
+        assertContains(source, "runtime.pauseActive()");
+        assertContains(source, "runtime.resumeActive()");
+        assertContains(source, "runtime.cancelActive()");
+        assertNotContains(source, "campaignBattleRunner != null && campaignBattleRunner.isRunning()");
+        assertNotContains(source, "minimumNormalBattleRunner != null && minimumNormalBattleRunner.isRunning()");
+        assertNotContains(source, "autoExpeditionSchedulerRunner != null && autoExpeditionSchedulerRunner.isRunning()");
+        assertNotContains(source, "guardedCombatRunner != null && guardedCombatRunner.isRunning()");
+        assertNotContains(source, "guardedCombatStepper != null && guardedCombatStepper.isRunning()");
+        assertNotContains(source, "liveCombatFlowWaiter != null && liveCombatFlowWaiter.isRunning()");
+        assertContains(source, "getApplicationContext()");
+        for (String id : new String[]{"normal", "expedition", "campaign", "guarded", "stepper", "waiter"}) {
+            assertContains(source, "\"" + id + "\"");
+        }
+    }
+
+    private static void mainActivityLifecycleReplaysWithoutDestroyCancellation() {
+        String source = productionSource("MainActivity.java");
+        assertContains(source, "protected void onStart()");
+        assertContains(source, "runtime.addListener(automationListener, true)");
+        assertContains(source, "protected void onStop()");
+        assertContains(source, "runtime.removeListener(automationListener)");
+        String onDestroy = methodSource(source, "protected void onDestroy()");
+        assertNotContains(onDestroy, "runtime.cancelActive()");
+        assertContains(source, "update.message");
+        assertContains(source, "update.detail");
+        assertContains(source, "update.logPath");
+        assertContains(source, "update.screenshotPath");
+    }
+
+    private static void assertSessionMigration(String source, String flowId, String logPrefix) {
+        assertContains(source, "private final AutomationSession session;");
+        assertContains(source, "new AutomationSession(\"" + flowId + "\"");
+        assertContains(source, "AndroidAutomationSessionSink.create(appContext, \"" + logPrefix + "\", runId)");
+        assertContains(source, "AutomationCallback callback");
+        assertNotContains(source, "interface Callback");
+        assertNotContains(source, "static final class Update");
+    }
+
+    private static String productionSource(String fileName) {
+        File workingDirectory = new File(System.getProperty("user.dir", "."));
+        File sourceDirectory = new File(
+                workingDirectory,
+                "app/src/main/java/org/openwsgr/autowsgrmobile"
+        );
+        if (!sourceDirectory.isDirectory()) {
+            sourceDirectory = new File(
+                    workingDirectory,
+                    "src/main/java/org/openwsgr/autowsgrmobile"
+            );
+        }
+        File file = new File(sourceDirectory, fileName);
+        try {
+            return new String(Files.readAllBytes(file.toPath()), StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            throw new AssertionError("cannot read source contract " + file, e);
+        }
+    }
+
+    private static String methodSource(String source, String signature) {
+        int start = source.indexOf(signature);
+        if (start < 0) {
+            throw new AssertionError("missing method: " + signature);
+        }
+        int nextOverride = source.indexOf("@Override", start + signature.length());
+        return nextOverride < 0 ? source.substring(start) : source.substring(start, nextOverride);
+    }
+
     private static MinimumBattlePageSignatures.Sampler sampler(final float[][] samples) {
         return new MinimumBattlePageSignatures.Sampler() {
             @Override
@@ -1857,6 +2001,12 @@ final class MinimumRunContractsTest {
     private static void assertContains(String text, String expected) {
         if (text == null || !text.contains(expected)) {
             throw new AssertionError("missing: " + expected + "\n" + text);
+        }
+    }
+
+    private static void assertNotContains(String text, String unexpected) {
+        if (text != null && text.contains(unexpected)) {
+            throw new AssertionError("unexpected: " + unexpected + "\n" + text);
         }
     }
 

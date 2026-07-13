@@ -201,9 +201,9 @@ final class GuardedCombatStepper {
     private final boolean executeGesture;
     private final ActionSpec spec;
     private final String planDetail;
+    private AutomationControl control = new AutomationControl();
     private LiveCombatFlowWaiter waiter;
     private Thread worker;
-    private volatile boolean cancelled;
     private boolean running;
 
     private GuardedCombatStepper(
@@ -458,7 +458,7 @@ final class GuardedCombatStepper {
         if (running) {
             return false;
         }
-        cancelled = false;
+        control = new AutomationControl();
         running = true;
         post(Update.running("Guarded stepper: starting " + spec.id, planDetail + "\n" + preflightDetail()));
 
@@ -470,7 +470,17 @@ final class GuardedCombatStepper {
         worker = new Thread(new Runnable() {
             @Override
             public void run() {
-                runGuardAndMaybeExecute();
+                try {
+                    runGuardAndMaybeExecute();
+                } catch (Throwable failure) {
+                    if (control.cancelled()) {
+                        finish(StepOutcome.CANCELLED, "Guarded stepper: cancelled",
+                                planDetail + "\nuncaught-exception-after-cancel=" + failure);
+                    } else {
+                        finish(StepOutcome.FAILED, "Guarded stepper: failed " + spec.id,
+                                planDetail + "\nuncaught-exception=" + failure);
+                    }
+                }
             }
         }, "AutoWSGR-guarded-stepper");
         worker.setPriority(Thread.MIN_PRIORITY);
@@ -479,7 +489,7 @@ final class GuardedCombatStepper {
     }
 
     synchronized void cancel() {
-        cancelled = true;
+        control.cancel();
         if (waiter != null) {
             waiter.cancel();
         }
@@ -487,6 +497,14 @@ final class GuardedCombatStepper {
         if (active != null) {
             active.interrupt();
         }
+    }
+
+    synchronized void pause() {
+        control.pause();
+    }
+
+    synchronized void resume() {
+        control.resume();
     }
 
     synchronized boolean isRunning() {
@@ -507,12 +525,13 @@ final class GuardedCombatStepper {
             ));
 
             NativeCombatRecognizer.Recognition recognition = recognizeGuardPhase();
-            if (cancelled) {
-                finish("Guarded stepper: cancelled", planDetail + "\nphaseGuard=cancelled");
+            if (control.cancelled()) {
+                finish(StepOutcome.CANCELLED, "Guarded stepper: cancelled", planDetail + "\nphaseGuard=cancelled");
                 return;
             }
             if (!recognition.matched) {
                 finish(
+                        StepOutcome.BLOCKED,
                         "Guarded stepper: blocked by phase guard",
                         planDetail + "\nphaseGuard=blocked expected=" + spec.guardPhase.id
                                 + ", latest=" + formatRecognition(recognition)
@@ -535,6 +554,7 @@ final class GuardedCombatStepper {
         GestureDispatch dispatch = dispatchGesture();
         if (!dispatch.dispatched) {
             finish(
+                    control.cancelled() ? StepOutcome.CANCELLED : StepOutcome.BLOCKED,
                     "Guarded stepper: blocked",
                     planDetail + "\nphaseGuard="
                             + (spec.requiresFreshPhaseGuard() ? "passed" : "skipped")
@@ -559,6 +579,9 @@ final class GuardedCombatStepper {
                 SystemClock.sleep(spec.preTapDelayMs);
             }
             for (int i = 0; i < spec.tapRepeat; i++) {
+                if (!checkpoint()) {
+                    return GestureDispatch.blocked("cancelled before tap " + (i + 1));
+                }
                 boolean tapped = AndroidControllerBridge.tap(spec.tapX, spec.tapY);
                 if (!tapped) {
                     return GestureDispatch.blocked("accessibility dispatch failed at tap " + (i + 1));
@@ -596,6 +619,9 @@ final class GuardedCombatStepper {
             int height = template == null ? 0 : template.bitmap.getHeight();
             float x = normalized(match.x + width / 2.0f, scanFrame.getWidth());
             float y = normalized(match.y + height / 2.0f, scanFrame.getHeight());
+            if (!checkpoint()) {
+                return GestureDispatch.blocked("cancelled before template tap");
+            }
             boolean tapped = AndroidControllerBridge.tap(x, y);
             return tapped
                     ? GestureDispatch.dispatched("templateTap=" + spec.templateTapKey.id
@@ -665,7 +691,8 @@ final class GuardedCombatStepper {
         );
         if (!waiter.start()) {
             running = false;
-            post(Update.finished(
+            post(Update.terminal(
+                    StepOutcome.BLOCKED,
                     "Guarded stepper: blocked",
                     planDetail + "\nbackground wait already running"
             ));
@@ -696,9 +723,9 @@ final class GuardedCombatStepper {
         }
     }
 
-    private synchronized void finish(String status, String detail) {
+    private synchronized void finish(StepOutcome outcome, String status, String detail) {
         running = false;
-        post(Update.finished(status, detail));
+        post(Update.terminal(outcome, status, detail));
     }
 
     private void handleWaitUpdate(LiveCombatFlowWaiter.Update waitUpdate) {
@@ -710,18 +737,18 @@ final class GuardedCombatStepper {
 
         running = false;
         if (waitUpdate.matched) {
-            post(Update.finished("Guarded stepper: wait matched " + spec.id, detail));
+            post(Update.terminal(StepOutcome.MATCHED, "Guarded stepper: wait matched " + spec.id, detail));
             return;
         }
         if (waitUpdate.cancelled) {
-            post(Update.finished("Guarded stepper: cancelled", detail));
+            post(Update.terminal(StepOutcome.CANCELLED, "Guarded stepper: cancelled", detail));
             return;
         }
         if (waitUpdate.timedOut) {
-            post(Update.finished("Guarded stepper: wait timed out " + spec.id, detail));
+            post(Update.terminal(StepOutcome.TIMED_OUT, "Guarded stepper: wait timed out " + spec.id, detail));
             return;
         }
-        post(Update.finished("Guarded stepper: failed " + spec.id, detail));
+        post(Update.terminal(StepOutcome.FAILED, "Guarded stepper: failed " + spec.id, detail));
     }
 
     private String buildPlan() {
@@ -772,6 +799,15 @@ final class GuardedCombatStepper {
         return String.format(java.util.Locale.US, "%.4f", score);
     }
 
+    private boolean checkpoint() {
+        try {
+            return control.checkpoint();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
     private void post(final Update update) {
         mainHandler.post(new Runnable() {
             @Override
@@ -786,12 +822,12 @@ final class GuardedCombatStepper {
 
         @Override
         public boolean shouldStop() {
-            return cancelled || SystemClock.elapsedRealtime() - startedAtMs >= PHASE_GUARD_TIMEOUT_MS;
+            return control.cancelled() || SystemClock.elapsedRealtime() - startedAtMs >= PHASE_GUARD_TIMEOUT_MS;
         }
 
         @Override
         public String stopReason() {
-            return cancelled ? "phase guard cancelled" : "phase guard timed out";
+            return control.cancelled() ? "phase guard cancelled" : "phase guard timed out";
         }
     }
 
@@ -799,23 +835,39 @@ final class GuardedCombatStepper {
         void onUpdate(Update update);
     }
 
+    enum StepOutcome {
+        RUNNING,
+        MATCHED,
+        BLOCKED,
+        TIMED_OUT,
+        CANCELLED,
+        FAILED
+    }
+
     static final class Update {
-        final boolean running;
+        final StepOutcome outcome;
         final String status;
         final String detail;
 
-        private Update(boolean running, String status, String detail) {
-            this.running = running;
+        private Update(StepOutcome outcome, String status, String detail) {
+            this.outcome = outcome;
             this.status = status;
             this.detail = detail;
         }
 
         static Update running(String status, String detail) {
-            return new Update(true, status, detail);
+            return new Update(StepOutcome.RUNNING, status, detail);
         }
 
-        static Update finished(String status, String detail) {
-            return new Update(false, status, detail);
+        static Update terminal(StepOutcome outcome, String status, String detail) {
+            if (outcome == StepOutcome.RUNNING) {
+                throw new IllegalArgumentException("terminal step required");
+            }
+            return new Update(outcome, status, detail);
+        }
+
+        boolean running() {
+            return outcome == StepOutcome.RUNNING;
         }
     }
 
