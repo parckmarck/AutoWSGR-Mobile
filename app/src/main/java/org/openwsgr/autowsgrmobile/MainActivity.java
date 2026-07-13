@@ -25,6 +25,7 @@ import android.widget.Spinner;
 import android.widget.TextView;
 
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -86,16 +87,54 @@ public final class MainActivity extends Activity {
     private Spinner sortieChapterSpinner;
     private Spinner sortieMapSpinner;
     private TextView sortieTargetDetail;
-    private TextView sortieConfigStatus;
     private NormalMapCatalog normalMapCatalog;
     private MinimumNormalBattleRunner minimumNormalBattleRunner;
     private AutoExpeditionSchedulerRunner autoExpeditionSchedulerRunner;
     private CampaignBattleRunner campaignBattleRunner;
+    private ConfigProfileRepository configProfileRepository;
+    private ConfigProfileUiController configProfileUiController;
+    private UnifiedAutomationConfig activeAutomationConfig;
+    private String activeConfigProfileId = ConfigProfileRepository.BUILTIN_ID;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        File externalDirectory = getExternalFilesDir(null);
+        File baseDirectory = externalDirectory == null ? getFilesDir() : externalDirectory;
+        File configsDirectory = new File(baseDirectory, "configs");
+        configProfileRepository = new ConfigProfileRepository(
+                configsDirectory,
+                DefaultUnifiedConfig.text(),
+                new FileActiveProfileStore(new File(configsDirectory, "active-profile.txt")),
+                new CurrentConfigProfileValidator()
+        );
+        Exception importError = null;
+        try {
+            LegacyConfigProfileImporter.importIfNeeded(
+                    configProfileRepository,
+                    new File(baseDirectory, "config")
+            );
+        } catch (IOException error) {
+            importError = error;
+        }
+        configProfileUiController = new ConfigProfileUiController(
+                this,
+                configProfileRepository,
+                new ConfigProfileUiController.Listener() {
+                    @Override public void onDefaultProfileChanged(
+                            ConfigProfile profile,
+                            UnifiedAutomationConfig config
+                    ) {
+                        activeAutomationConfig = config;
+                        activeConfigProfileId = profile.id;
+                    }
+                }
+        );
         setContentView(buildUi());
+        configProfileUiController.loadActive();
+        if (importError != null) {
+            configProfileUiController.showError(importError);
+        }
         requestNotificationPermissionIfNeeded();
     }
 
@@ -160,6 +199,11 @@ public final class MainActivity extends Activity {
         );
         subtitle.setPadding(0, dp(8), 0, dp(14));
         root.addView(subtitle);
+
+        TextView configHeading = text("配置档案", 18, 0xFF263238, true);
+        configHeading.setPadding(0, dp(8), 0, dp(6));
+        root.addView(configHeading);
+        root.addView(configProfileUiController.buildView());
 
         captureStatus = statusText();
         accessibilityStatus = statusText();
@@ -235,12 +279,6 @@ public final class MainActivity extends Activity {
             @Override
             public void onClick(View view) {
                 refreshStatus();
-            }
-        }));
-        root.addView(button("写入默认出征配置", new View.OnClickListener() {
-            @Override
-            public void onClick(View view) {
-                writeDefaultSortieConfig();
             }
         }));
         root.addView(button("运行索敌画面诊断", new View.OnClickListener() {
@@ -378,8 +416,6 @@ public final class MainActivity extends Activity {
 
         sortieTargetDetail = statusText();
         root.addView(sortieTargetDetail);
-        sortieConfigStatus = statusText();
-        root.addView(sortieConfigStatus);
 
         String[] chapters = normalMapCatalog.chapterLabels();
         if (chapters.length == 0) {
@@ -442,7 +478,6 @@ public final class MainActivity extends Activity {
         NormalSortieTarget target = selectedNormalSortieTarget();
         sortieTargetDetail.setText("普通图：" + target.label()
                 + "，地图：" + target.mapAssetPath());
-        refreshSortieConfigStatus();
     }
 
     private NormalSortieTarget selectedNormalSortieTarget() {
@@ -512,7 +547,6 @@ public final class MainActivity extends Activity {
         frameStatus.setText("画面帧：" + snapshot.toStatusLine());
         pixelStatus.setText(AndroidControllerBridge.centerPixelStatus());
         runnerStatus.setText("运行状态：核心诊断、策略自检和受保护一步执行已就绪；高级调试入口已隐藏");
-        refreshSortieConfigStatus();
         if (TextUtils.isEmpty(selfTestStatus.getText())) {
             selfTestStatus.setText("Runtime self-test: not run");
         }
@@ -970,23 +1004,11 @@ public final class MainActivity extends Activity {
         guardedCombatRunner.cancel();
     }
 
-    private void refreshSortieConfigStatus() {
-        if (sortieConfigStatus == null) {
+    private void runMinimumNormalBattle() {
+        UnifiedAutomationConfig activeConfig = activeConfigOrBlockStart();
+        if (activeConfig == null) {
             return;
         }
-        sortieConfigStatus.setText(NormalSortieConfigStore.statusLine(this));
-    }
-
-    private void writeDefaultSortieConfig() {
-        try {
-            NormalSortieConfigStore.LoadResult result = NormalSortieConfigStore.writeDefault(this);
-            sortieConfigStatus.setText("出征配置：" + result.detail);
-        } catch (IOException e) {
-            sortieConfigStatus.setText("出征配置：写入失败，" + e.getMessage());
-        }
-    }
-
-    private void runMinimumNormalBattle() {
         if (minimumNormalBattleRunner != null && minimumNormalBattleRunner.isRunning()) {
             minimumRunStatus.setText("最小普通战：正在运行");
             return;
@@ -1011,19 +1033,13 @@ public final class MainActivity extends Activity {
             minimumRunStatus.setText("最小普通战：等待任务正在运行");
             return;
         }
-        NormalSortieConfigStore.LoadResult configResult;
-        try {
-            configResult = NormalSortieConfigStore.loadOrCreateDefault(this);
-        } catch (IOException e) {
-            minimumRunStatus.setText("最小普通战：配置不可用");
-            minimumRunDetail.setText(e.getMessage());
-            refreshSortieConfigStatus();
-            return;
-        }
-        sortieConfigStatus.setText("出征配置：" + configResult.detail);
-        minimumNormalBattleRunner = new MinimumNormalBattleRunner(this, configResult.config, minimumRunnerCallback());
+        minimumNormalBattleRunner = new MinimumNormalBattleRunner(
+                this,
+                activeConfig.normalSortie,
+                minimumRunnerCallback()
+        );
         minimumRunStatus.setText("最小普通战：启动中");
-        minimumRunDetail.setText("出征配置：" + configResult.file.getAbsolutePath());
+        minimumRunDetail.setText("默认配置：" + activeConfigProfileId);
         minimumRunLogPath.setText("运行日志：准备生成");
         minimumRunScreenshotPath.setText("失败截图：未生成");
         if (!minimumNormalBattleRunner.start()) {
@@ -1032,6 +1048,10 @@ public final class MainActivity extends Activity {
     }
 
     private void runAutoExpeditionScheduler() {
+        UnifiedAutomationConfig activeConfig = activeConfigOrBlockStart();
+        if (activeConfig == null) {
+            return;
+        }
         if (isAutoExpeditionRunning()) {
             minimumRunStatus.setText("自动远征：正在运行");
             return;
@@ -1056,25 +1076,18 @@ public final class MainActivity extends Activity {
             minimumRunStatus.setText("自动远征：等待任务正在运行");
             return;
         }
-        AutoExpeditionConfigStore.LoadResult configResult;
-        try {
-            configResult = AutoExpeditionConfigStore.loadOrCreateDefault(this);
-        } catch (IOException e) {
-            minimumRunStatus.setText("自动远征：配置不可用");
-            minimumRunDetail.setText(e.getMessage());
-            return;
-        }
         autoExpeditionSchedulerRunner = new AutoExpeditionSchedulerRunner(
                 this,
-                configResult.config,
+                activeConfig.autoExpedition,
                 autoExpeditionCallback()
         );
         minimumRunStatus.setText("自动远征：启动中");
-        minimumRunDetail.setText("远征配置：" + configResult.detail);
+        minimumRunDetail.setText("默认配置：" + activeConfigProfileId
+                + "，远征间隔：" + activeConfig.autoExpedition.intervalSeconds + " 秒");
         minimumRunLogPath.setText("运行日志：准备生成");
         minimumRunScreenshotPath.setText("失败截图：未生成");
         if (!autoExpeditionSchedulerRunner.start()) {
-            if (configResult.config.enabled()) {
+            if (activeConfig.autoExpedition.enabled()) {
                 minimumRunStatus.setText("自动远征：正在运行");
             } else {
                 autoExpeditionSchedulerRunner = null;
@@ -1130,6 +1143,10 @@ public final class MainActivity extends Activity {
     }
 
     private void runCampaignBattle() {
+        UnifiedAutomationConfig activeConfig = activeConfigOrBlockStart();
+        if (activeConfig == null) {
+            return;
+        }
         if (isAutoExpeditionRunning()) {
             minimumRunStatus.setText("战役：自动远征正在运行");
             return;
@@ -1154,23 +1171,32 @@ public final class MainActivity extends Activity {
             minimumRunStatus.setText("战役：等待任务正在运行");
             return;
         }
-        CampaignBattleConfigStore.LoadResult configResult;
-        try {
-            configResult = CampaignBattleConfigStore.loadOrCreateDefault(this);
-        } catch (IOException e) {
-            minimumRunStatus.setText("战役：配置不可用");
-            minimumRunDetail.setText(e.getMessage());
-            return;
-        }
-        campaignBattleRunner = new CampaignBattleRunner(this, configResult.config, campaignBattleCallback());
+        campaignBattleRunner = new CampaignBattleRunner(
+                this,
+                activeConfig.campaign,
+                campaignBattleCallback()
+        );
         minimumRunStatus.setText("战役：启动中");
-        minimumRunDetail.setText("战役配置：" + configResult.detail);
+        minimumRunDetail.setText("默认配置：" + activeConfigProfileId
+                + "，" + activeConfig.campaign.summary());
         minimumRunLogPath.setText("运行日志：准备生成");
         minimumRunScreenshotPath.setText("失败截图：未生成");
         if (!campaignBattleRunner.start()) {
             campaignBattleRunner = null;
             minimumRunStatus.setText("战役：启动失败");
         }
+    }
+
+    private UnifiedAutomationConfig activeConfigOrBlockStart() {
+        if (activeAutomationConfig != null) {
+            return activeAutomationConfig;
+        }
+        minimumRunStatus.setText("默认配置不可用");
+        String parserError = configProfileUiController == null
+                ? "配置档案尚未加载"
+                : configProfileUiController.lastError();
+        minimumRunDetail.setText(TextUtils.isEmpty(parserError) ? "请检查配置档案" : parserError);
+        return null;
     }
 
     private void cancelCampaignBattle() {
