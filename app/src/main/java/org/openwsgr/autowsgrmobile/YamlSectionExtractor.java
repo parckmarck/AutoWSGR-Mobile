@@ -82,41 +82,54 @@ final class YamlSectionExtractor {
     }
 
     private static int mappingColon(String line) {
-        boolean singleQuoted = false;
-        boolean doubleQuoted = false;
-        for (int index = 0; index < line.length(); index++) {
+        int first = 0;
+        while (first < line.length() && Character.isWhitespace(line.charAt(first))) {
+            first++;
+        }
+        if (first < line.length() && (line.charAt(first) == '\'' || line.charAt(first) == '"')) {
+            return quotedMappingColon(line, first, line.charAt(first));
+        }
+        return plainMappingColon(line, first);
+    }
+
+    private static int plainMappingColon(String line, int first) {
+        for (int index = first; index < line.length(); index++) {
             char character = line.charAt(index);
-            if (doubleQuoted) {
-                if (character == '\\' && index + 1 < line.length()) {
-                    index++;
-                } else if (character == '"') {
-                    doubleQuoted = false;
-                }
-                continue;
-            }
-            if (singleQuoted) {
-                if (character == '\'' && index + 1 < line.length()
-                        && line.charAt(index + 1) == '\'') {
-                    index++;
-                } else if (character == '\'') {
-                    singleQuoted = false;
-                }
-                continue;
-            }
             if (character == '#' && (index == 0 || Character.isWhitespace(line.charAt(index - 1)))) {
                 return -1;
             }
-            if (character == '"') {
-                doubleQuoted = true;
-            } else if (character == '\'') {
-                singleQuoted = true;
-            } else if (character == ':'
+            if (character == ':'
                     && (index + 1 == line.length()
                     || Character.isWhitespace(line.charAt(index + 1)))) {
                 return index;
             }
         }
         return -1;
+    }
+
+    private static int quotedMappingColon(String line, int first, char quote) {
+        int closingQuote = -1;
+        for (int index = first + 1; index < line.length(); index++) {
+            char character = line.charAt(index);
+            if (quote == '"' && character == '\\' && index + 1 < line.length()) {
+                index++;
+                continue;
+            }
+            if (character != quote) {
+                continue;
+            }
+            if (quote == '\'' && index + 1 < line.length()
+                    && line.charAt(index + 1) == '\'') {
+                index++;
+                continue;
+            }
+            closingQuote = index;
+            break;
+        }
+        if (closingQuote < 0) {
+            return -1;
+        }
+        return plainMappingColon(line, closingQuote + 1);
     }
 
     private static boolean startsIndicator(String line, char indicator) {

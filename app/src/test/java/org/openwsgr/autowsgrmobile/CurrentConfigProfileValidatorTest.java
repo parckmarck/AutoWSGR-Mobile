@@ -142,4 +142,14 @@ public final class CurrentConfigProfileValidatorTest {
                 () -> validator.validate("quoted-escape.yaml", "\"custom\\q\": value\n")
         );
     }
+
+    @Test public void quoteCharactersInsidePlainKeysRemainLiteral() throws Exception {
+        String yaml = "owner's_note: apostrophe\nowner\"s_note: double-quote\n";
+
+        validator.validate("plain-quotes.yaml", yaml);
+        Map<String, String> mappings = YamlSectionExtractor.topLevelMappings("plain-quotes.yaml", yaml);
+
+        assertEquals("apostrophe", mappings.get("owner's_note"));
+        assertEquals("double-quote", mappings.get("owner\"s_note"));
+    }
 }
