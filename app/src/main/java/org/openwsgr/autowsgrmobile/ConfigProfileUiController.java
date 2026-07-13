@@ -344,10 +344,11 @@ final class ConfigProfileUiController {
             return;
         }
         try {
-            ConfigProfile selected = repository.setDefault(state.selectedId());
-            UnifiedAutomationConfig config = UnifiedAutomationConfig.parse(selected.id, selected.yaml);
-            defaultProfileId = selected.id;
-            listener.onDefaultProfileChanged(selected, config);
+            ConfigProfile candidate = repository.load(state.selectedId());
+            UnifiedAutomationConfig config = UnifiedAutomationConfig.parse(candidate.id, candidate.yaml);
+            repository.setDefault(candidate.id);
+            defaultProfileId = candidate.id;
+            listener.onDefaultProfileChanged(candidate, config);
             lastError = "";
             notice = "已设为默认配置。";
             renderStatus();

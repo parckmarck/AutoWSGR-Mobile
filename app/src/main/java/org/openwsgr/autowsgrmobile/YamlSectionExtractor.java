@@ -44,15 +44,16 @@ final class YamlSectionExtractor {
                 values.put(currentKey, currentBody.toString());
             }
             String trimmedLine = line.trim();
-            if (trimmedLine.startsWith("-") || trimmedLine.startsWith("?")) {
+            if (startsIndicator(trimmedLine, '-') || startsIndicator(trimmedLine, '?')) {
                 throw new IOException(location + ": unsupported top-level YAML construct at line "
                         + (index + 1));
             }
             int colon = mappingColon(line);
-            String key = colon < 0 ? "" : line.substring(0, colon).trim();
-            if (colon < 0 || key.isEmpty()) {
+            String rawKey = colon < 0 ? "" : line.substring(0, colon).trim();
+            if (colon < 0 || rawKey.isEmpty()) {
                 throw new IOException(location + ": invalid top-level mapping at line " + (index + 1));
             }
+            String key = decodeKey(location, index + 1, rawKey);
             if (values.containsKey(key) || key.equals(currentKey)) {
                 throw new IOException(location + ": duplicate top-level key " + key
                         + " at line " + (index + 1));
@@ -102,17 +103,86 @@ final class YamlSectionExtractor {
                 }
                 continue;
             }
-            if (character == '#') {
+            if (character == '#' && (index == 0 || Character.isWhitespace(line.charAt(index - 1)))) {
                 return -1;
             }
             if (character == '"') {
                 doubleQuoted = true;
             } else if (character == '\'') {
                 singleQuoted = true;
-            } else if (character == ':') {
+            } else if (character == ':'
+                    && (index + 1 == line.length()
+                    || Character.isWhitespace(line.charAt(index + 1)))) {
                 return index;
             }
         }
         return -1;
+    }
+
+    private static boolean startsIndicator(String line, char indicator) {
+        return !line.isEmpty()
+                && line.charAt(0) == indicator
+                && (line.length() == 1 || Character.isWhitespace(line.charAt(1)));
+    }
+
+    private static String decodeKey(String source, int lineNumber, String rawKey) throws IOException {
+        char quote = rawKey.charAt(0);
+        if (quote != '\'' && quote != '"') {
+            return rawKey;
+        }
+        if (rawKey.length() < 2 || rawKey.charAt(rawKey.length() - 1) != quote) {
+            throw invalidQuotedKey(source, lineNumber);
+        }
+        StringBuilder decoded = new StringBuilder();
+        int end = rawKey.length() - 1;
+        for (int index = 1; index < end; index++) {
+            char character = rawKey.charAt(index);
+            if (quote == '\'') {
+                if (character != '\'') {
+                    decoded.append(character);
+                    continue;
+                }
+                if (index + 1 < end && rawKey.charAt(index + 1) == '\'') {
+                    decoded.append('\'');
+                    index++;
+                    continue;
+                }
+                throw invalidQuotedKey(source, lineNumber);
+            }
+            if (character == '"') {
+                throw invalidQuotedKey(source, lineNumber);
+            }
+            if (character != '\\') {
+                decoded.append(character);
+                continue;
+            }
+            if (++index >= end) {
+                throw invalidQuotedKey(source, lineNumber);
+            }
+            char escaped = rawKey.charAt(index);
+            if (escaped == '"' || escaped == '\\' || escaped == '/') {
+                decoded.append(escaped);
+            } else if (escaped == 'n') {
+                decoded.append('\n');
+            } else if (escaped == 'r') {
+                decoded.append('\r');
+            } else if (escaped == 't') {
+                decoded.append('\t');
+            } else if (escaped == 'b') {
+                decoded.append('\b');
+            } else if (escaped == 'f') {
+                decoded.append('\f');
+            } else {
+                throw invalidQuotedKey(source, lineNumber);
+            }
+        }
+        if (decoded.length() == 0) {
+            throw invalidQuotedKey(source, lineNumber);
+        }
+        return decoded.toString();
+    }
+
+    private static IOException invalidQuotedKey(String source, int lineNumber) {
+        return new IOException(source + ": invalid or unsupported quoted key at line " + lineNumber);
     }
 }

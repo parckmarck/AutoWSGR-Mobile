@@ -91,4 +91,55 @@ public final class CurrentConfigProfileValidatorTest {
         assertEquals("\"每日: #一号\" # trailing comment", mappings.get("profile_name"));
         assertEquals("'literal: # retained'", mappings.get("upstream_value"));
     }
+
+    @Test public void urlWithoutMappingSeparationIsRejected() {
+        assertThrows(
+                IOException.class,
+                () -> validator.validate("url.yaml", "https://example.invalid\n")
+        );
+    }
+
+    @Test public void plainKeysMayStartWithDashOrContainNonCommentHash() throws Exception {
+        String yaml = "-custom: first\ncustom#tag: second\n";
+
+        validator.validate("plain-keys.yaml", yaml);
+        Map<String, String> mappings = YamlSectionExtractor.topLevelMappings("plain-keys.yaml", yaml);
+
+        assertEquals("first", mappings.get("-custom"));
+        assertEquals("second", mappings.get("custom#tag"));
+    }
+
+    @Test public void quotedRecognizedKeyUsesCampaignParser() {
+        IOException invalid = assertThrows(
+                IOException.class,
+                () -> validator.validate("quoted-campaign.yaml", "\"campaign\":\n  times: 0\n")
+        );
+
+        assertTrue(invalid.getMessage().contains("quoted-campaign.yaml"));
+        assertTrue(invalid.getMessage().contains("campaign"));
+    }
+
+    @Test public void quotedKeysDecodeEscapesBeforeDuplicateDetection() throws Exception {
+        Map<String, String> mappings = YamlSectionExtractor.topLevelMappings(
+                "quoted-keys.yaml",
+                "'custom''key': one\n\"custom\\\"key\": two\n"
+        );
+        assertEquals("one", mappings.get("custom'key"));
+        assertEquals("two", mappings.get("custom\"key"));
+
+        IOException duplicate = assertThrows(
+                IOException.class,
+                () -> validator.validate("quoted-duplicate.yaml", "campaign:\n\"campaign\":\n")
+        );
+        assertTrue(duplicate.getMessage().contains("line 2"));
+
+        assertThrows(
+                IOException.class,
+                () -> validator.validate("quoted-suffix.yaml", "\"custom\" suffix: value\n")
+        );
+        assertThrows(
+                IOException.class,
+                () -> validator.validate("quoted-escape.yaml", "\"custom\\q\": value\n")
+        );
+    }
 }
