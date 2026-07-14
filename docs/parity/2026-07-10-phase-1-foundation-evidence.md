@@ -2,7 +2,9 @@
 
 - **验收日期**：2026-07-14（Asia/Shanghai）
 - **上游语义锚点**：`OpenWSGR/AutoWSGR@97f8b16`
-- **分支基线**：`500c835`
+- **Phase 1 分支基线**：`500c835`
+- **Task 7 基线**：`216a1aafdaa846f198334d9ead33366d5458cd42`
+- **Task 7 首个证据提交**：`b77f531`（本次复审所用 head）
 - **已验证实现 HEAD**：`216a1aafdaa846f198334d9ead33366d5458cd42`
 - **分支**：`codex/android-parity-phase-1-foundation`
 - **范围**：标准构建、持久化 YAML 配置档案、中文编辑界面、统一运行契约与互斥、
@@ -64,6 +66,20 @@ BUILD SUCCESSFUL in 9s
 49 actionable tasks: 22 executed, 27 from cache
 ```
 
+实际执行记录：
+
+| 顺序 | 命令 | 退出码 / PowerShell 结果 |
+|---:|---|---|
+| 1 | `.\gradlew.bat --stop` | `0` |
+| 2 | `.\gradlew.bat --no-daemon clean testDebugUnitTest lintDebug assembleDebug` | `1`，在配置前被 `fileHashes.lock` ACL 拒绝 |
+| 3 | `.\build-apk.ps1` | `1`，内部调用同一 `gradlew.bat` 时被相同 ACL 拒绝 |
+| 4 | `.\build-apk.ps1`（确认性重试） | `1`，相同 ACL；此后不再重复该失败路径 |
+| 5 | 上述 `java ... GradleWrapperMain ... clean testDebugUnitTest lintDebug assembleDebug` | `0` |
+| 6 | `Copy-Item` 脚本等价后处理 | `$? = True` |
+| 7 | `aapt dump badging` | `0` |
+| 8 | `apksigner verify --verbose --print-certs` | `0` |
+| 9 | `Get-FileHash -Algorithm SHA256` | `$? = True` |
+
 | 检查 | 结果 |
 |---|---:|
 | JUnit 测试套件 | 15 |
@@ -76,6 +92,23 @@ BUILD SUCCESSFUL in 9s
 `build-apk.ps1` 仅因同一主机锁在调用 `gradlew.bat` 时终止。验收随后按脚本的剩余步骤
 把上述成功构建的 `app-debug.apk` 复制到 `build/dist`，并独立运行 `aapt`、`apksigner`
 和 SHA-256 校验。标准脚本在不受该主机 ACL 限制的 Windows 环境中仍是推荐入口。
+
+脚本等价后处理和校验使用的完整命令为：
+
+```powershell
+$Sdk = Join-Path $env:LOCALAPPDATA 'Android\Sdk'
+$RunId = 1784017301868
+$SourceApk = Join-Path $PWD 'app\build\outputs\apk\debug\app-debug.apk'
+$Dist = Join-Path $PWD 'build\dist'
+New-Item -ItemType Directory -Force $Dist | Out-Null
+$Apk = Join-Path $Dist "AutoWSGR-Mobile-debug-$RunId.apk"
+Copy-Item -LiteralPath $SourceApk -Destination $Apk -Force
+
+& "$Sdk\build-tools\35.0.0\aapt.exe" dump badging $Apk
+& "$Sdk\build-tools\35.0.0\apksigner.bat" `
+  verify --verbose --print-certs $Apk
+Get-FileHash $Apk -Algorithm SHA256
+```
 
 ## 3. APK 产物
 
