@@ -4,14 +4,16 @@
 - **上游语义锚点**：`OpenWSGR/AutoWSGR@97f8b16`
 - **Phase 1 分支基线**：`500c835`
 - **首次全分支最终审查输入 HEAD**：`a119bc4`
-- **文档前已验证实现 HEAD**：`216a1aafdaa846f198334d9ead33366d5458cd42`
+- **最终验证实现 HEAD**：`38e153a2361a385c8362cd7c30d8cdba68dcba46`
+- **初始文档前实现 HEAD**：`216a1aafdaa846f198334d9ead33366d5458cd42`
 - **初始证据提交**：`b77f531`
 - **分支**：`codex/android-parity-phase-1-foundation`
 - **范围**：标准构建、持久化 YAML 配置档案、中文编辑界面、统一运行契约与互斥、
   结构化终态、帧/资产性能和并发修复。
 
 本文只验收六阶段设计中的 Phase 1，不声明已达到最终 95% 功能对等。
-以上提交号记录审查与初始证据的历史输入，不要求本文自引用后续审查修复提交。
+以上提交号同时记录首次审查、初始证据和最终产物所对应的实现边界；本文不要求自引用
+后续纯文档提交。
 
 ## 1. 工具链
 
@@ -84,11 +86,14 @@ BUILD SUCCESSFUL in 9s
 | 检查 | 结果 |
 |---|---:|
 | JUnit 测试套件 | 15 |
-| JUnit 测试 | 99 |
+| JUnit 测试 | 105 |
 | failures / errors / skipped | 0 / 0 / 0 |
 | Android Lint error | 0 |
-| Android Lint warning | 40 |
+| Android Lint warning | 39 |
 | `assembleDebug` | 成功 |
+
+上述最终结果在实现 HEAD `38e153a` 上重新执行：15 个测试套件、105 个测试，退出码为
+`0`；不是沿用修复前的测试结果。
 
 `build-apk.ps1` 仅因同一主机锁在调用 `gradlew.bat` 时终止。验收随后按脚本的剩余步骤
 把上述成功构建的 `app-debug.apk` 复制到 `build/dist`，并独立运行 `aapt`、`apksigner`
@@ -98,7 +103,7 @@ BUILD SUCCESSFUL in 9s
 
 ```powershell
 $Sdk = Join-Path $env:LOCALAPPDATA 'Android\Sdk'
-$RunId = 1784017301868
+$RunId = 1784028850998
 $SourceApk = Join-Path $PWD 'app\build\outputs\apk\debug\app-debug.apk'
 $Dist = Join-Path $PWD 'build\dist'
 New-Item -ItemType Directory -Force $Dist | Out-Null
@@ -114,12 +119,14 @@ Get-FileHash $Apk -Algorithm SHA256
 ## 3. APK 产物
 
 - **仓库相对路径**：
-  `build/dist/AutoWSGR-Mobile-debug-1784017301868.apk`
+  `build/dist/AutoWSGR-Mobile-debug-1784028850998.apk`
 - **本次机器绝对路径**：
-  `C:\Users\14612\Documents\Codex\2026-06-16\apk-openwsgr-autowsgr-https-github-com\work\AutoWSGR-Mobile\.worktrees\android-parity-phase-1-foundation\build\dist\AutoWSGR-Mobile-debug-1784017301868.apk`
-- **大小**：1,236,260 bytes
+  `C:\Users\14612\Documents\Codex\2026-06-16\apk-openwsgr-autowsgr-https-github-com\work\AutoWSGR-Mobile\.worktrees\android-parity-phase-1-foundation\build\dist\AutoWSGR-Mobile-debug-1784028850998.apk`
+- **大小**：1,237,560 bytes
 - **SHA-256**：
-  `AB3D8C4B659788869F4656C56C493AAB9D8F2FDC19298C3116B8A573DCAEE46D`
+  `FE235423B41B74F083DCB8DF4EDC4DCB6475105CB6277AF8AD834C516BA82550`
+
+复制后的分发 APK 与 `app/build/outputs/apk/debug/app-debug.apk` 的 SHA-256 和大小完全一致。
 
 `aapt dump badging`：
 
@@ -154,10 +161,14 @@ Get-FileHash $Apk -Algorithm SHA256
 | 物理画布 | 720×1280，density 180 |
 | 游戏包 | `com.huanmeng.zhanjian2`（已安装） |
 
-设备原有 APK 使用不同签名，因此 `adb install -r` 正确拒绝覆盖。卸载旧包之前已把可访问的
-外部应用数据备份到
+首次设备验收时，设备原有 APK 使用不同签名，因此 `adb install -r` 正确拒绝覆盖。卸载旧包
+之前已把可访问的外部应用数据备份到
 `C:\Users\14612\AppData\Local\Temp\AutoWSGR-device-backup-1784018095922`
-（84 个文件，14,050,369 bytes），随后卸载旧包并安装本次 APK。冷启动耗时 448 ms。
+（84 个文件，14,050,369 bytes），随后卸载旧包并安装初始验收 APK，冷启动耗时 448 ms。
+
+最终产物 `AutoWSGR-Mobile-debug-1784028850998.apk` 使用同一调试证书，随后以
+`adb install -r` 原位更新成功；`am start -W` 冷启动返回 `Status: ok`、`LaunchState: COLD`、
+`TotalTime: 255` ms，包信息的 `lastUpdateTime` 为 `2026-07-14 19:35:29`。
 
 ### 4.2 配置档案与中文前端
 
@@ -169,7 +180,8 @@ Get-FileHash $Apk -Algorithm SHA256
    `/storage/emulated/0/Android/data/org.openwsgr.autowsgrmobile/files/configs/阶段一验收.yaml`。
 4. `active-profile.txt` 内容为 `阶段一验收.yaml`；界面显示
    `配置：阶段一验收；默认：是；状态：未修改`。
-5. force-stop/relaunch 后仍自动加载 `阶段一验收`，证明默认档案跨进程重启保持。
+5. force-stop/relaunch 以及最终 APK 原位更新后仍自动加载 `阶段一验收`，证明默认档案跨进程
+   重启和包更新保持。
 
 对应实现和自动化测试：
 
@@ -181,15 +193,15 @@ Get-FileHash $Apk -Algorithm SHA256
 
 ### 4.3 截图和无障碍
 
-- 安全设置中启用组件：
+- 最终 APK 更新后重新启用组件：
   `org.openwsgr.autowsgrmobile/.AutoWsgrAccessibilityService`。
 - `dumpsys accessibility`/服务状态确认服务已绑定，界面显示
   `无障碍触控：已启用`。
 - 接受系统 MediaProjection 对话框后，`dumpsys media_projection` 显示
   `org.openwsgr.autowsgrmobile: TYPE_SCREEN_CAPTURE`。
-- `ScreenCaptureService` 是活动的前台服务；界面实测：
+- `ScreenCaptureService` 是活动的前台服务；最终 APK 界面实测：
   `屏幕捕获：已授权，正在接收画面`，
-  `Screen frame: 720x1280 RGBA, 3686400 bytes, frames=1996, age=87ms`。
+  `Screen frame: 720x1280 RGBA, 3686400 bytes, frames=207, age=129ms`。
 
 ### 4.4 流程互斥、停止、日志与失败截图
 
@@ -200,13 +212,22 @@ Get-FileHash $Apk -Algorithm SHA256
 4. 点击“停止当前流程”，界面和日志都得到
    `当前流程：guarded，结果：CANCELLED` / `Guarded runner: cancelled`。
 
+最终 APK 另做了本轮并发修复对应的设备回归：启动受保护作战后约 250 ms 点击暂停，等待
+5 秒（长于 3.5 秒 phase-scan deadline）仍未超时，随后点击停止。日志
+`/data/user/0/org.openwsgr.autowsgrmobile/files/runs/guarded-combat-1784029264397.log`
+依次记录 `RUNNING`、扫描中的 `RUNNING` 和唯一终态 `CANCELLED`，终态细节为
+`phaseScan=cancelled`。这证明最终产物的暂停不消耗该 deadline，且暂停中取消仍能解锁并取得
+终态优先权。
+
 另外一次自动远征实测启动了已安装游戏；在当前画面无法可靠识别时以
 `initial-state-timeout` 保守阻断，没有猜测点击。运行时保存了：
 
 - 日志：`/data/user/0/org.openwsgr.autowsgrmobile/files/runs/auto-expedition-1784020018333.log`
 - 失败截图：`/data/user/0/org.openwsgr.autowsgrmobile/files/failures/auto-expedition-1784020018333.png`
 
-本轮设备日志筛选 `FATAL EXCEPTION`、本包进程崩溃和 ANR，匹配数为 0。
+最终 APK 安装、冷启动、授权、暂停/停止回归后的设备日志筛选 `FATAL EXCEPTION`、本包进程
+崩溃和 ANR，匹配数为 0；验收结束时默认配置仍为 `阶段一验收`，无障碍服务已绑定，
+MediaProjection 与前台截图服务均保持活动并持续产生新帧。
 
 对应契约测试：
 
