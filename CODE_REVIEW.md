@@ -44,10 +44,18 @@
 ## 二、性能
 
 ### 4. `ScreenFrameStore.update` 逐像素 `ByteBuffer.get`
+> **状态（2026-07-14）：已修复。** `FrameBufferCopier` 对 RGBA 行执行批量复制，
+> `ScreenFrameStore` 复用紧凑帧和 ARGB 缓存；`FrameBufferCopierTest` 覆盖紧凑行、
+> 行填充、像素填充及非法缓冲区边界。
+
 - `ScreenFrameStore.java:32-43`：每帧 `width×height×4` 次单字节 `buffer.get(int)`（1080p 约 1000 万次/帧）。虽在采集工作线程、不致 ANR，但严重限制帧率、空耗 CPU/电量。
 - **建议**：当 `pixelStride==4` 时按行 `buffer.get(tight, dstRow, rowBytes)` 批量拷贝；`rowStride==width*4` 时可整块拷贝。
 
 ### 5. `AutoWsgrAssetStore` 每次读取都重开并线性扫描整个 ZIP，无缓存
+> **状态（2026-07-14）：已修复。** `ZipAssetIndex` 一次读取 ZIP 并保存防御性字节副本，
+> `AutoWsgrAssetStore` 以线程安全的进程级惰性缓存复用索引；`ZipAssetIndexTest`
+> 覆盖重复读取、缺失条目、目录、损坏 ZIP 和防御性复制。
+
 - `AutoWsgrAssetStore.java:28-47`：单次 `read()` 是 O(N)（374 个条目），且无任何缓存。
 - 放大效应：`NativeTemplateKey.loadTemplates` 对每个路径各扫一次（`NativeTemplateKey.java:46-53`）；`NativeCombatRecognizer.identifyCurrent` 对每个候选相位都重新 `loadTemplates`（`NativeCombatRecognizer.java:47`）；runner 每步都做。
 - **建议**：进程内缓存解压后的字节/位图（或启动时把 ZIP 解到内部存储一次），模板按 key 缓存复用。
@@ -65,6 +73,11 @@
 ## 三、线程与并发
 
 ### 8. `GuardedCombatStepper` 的 `running` / `waiter` 字段访问未一致同步
+> **状态（2026-07-14）：已修复。** waiter 发布、启动、取消、终态与异常启动均由
+> 同步的 `WaiterLifecycle` 管理，运行/终态发布再通过原子发布门串行化；
+> `GuardedStepperLifecycleTest` 和 `Task5RunnerSafetyTest` 覆盖取消竞争、启动抛异常、
+> 迟到 RUNNING 更新和单终态约束。
+
 - `running`（`GuardedCombatStepper.java:191`）：`start/cancel/isRunning/finish` 都 `synchronized`，但 `startWaiter()` 第 602 行与 `handleWaitUpdate()` 第 641 行**未持锁**写 `running=false`；前者可能在工作线程执行，存在与 `isRunning()` 的可见性/竞争窗口。
 - `waiter` 字段在 `startWaiter`（工作线程，未同步）写、`cancel`（同步）读，取消恰好与赋值并发时可能漏掉对 waiter 的取消。
 - 影响低（窗口窄），但**建议**：`running` 改 `volatile` 或所有访问入锁；`waiter` 赋值也纳入同步块。
@@ -75,6 +88,11 @@
 ## 四、健壮性与可维护性
 
 ### 9. 用人类可读状态串驱动控制流（脆弱耦合）
+> **状态（2026-07-14）：已修复。** stepper 使用 `StepOutcome`，业务运行器统一使用
+> `AutomationOutcome`；`GuardedCombatRunner.stepCompleted` 和终态映射只读取枚举。
+> `GuardedStepOutcomeTest` 验证本地化文案不影响控制流，旧契约测试明确禁止
+> `status.contains(...)`/`stepperStatus.contains(...)`。
+
 - `GuardedCombatRunner.stepCompleted` 用 `update.status.contains("wait matched")`、`finalStatus` 用 `.contains("cancelled"/"blocked"/"timed out")`（`GuardedCombatRunner.java:544-562`）判流程走向。一旦有人改了状态文案，runner 逻辑就静默错乱。
 - **建议**：用枚举/布尔结果位（`Update` 里加 `matched/cancelled/timedOut/blocked` 字段，像 `LiveCombatFlowWaiter.Update` 那样）替代字符串匹配。
 
@@ -190,3 +208,25 @@
 2. #5 资产缓存、#4 帧拷贝——性能 / 电量。
 3. #9 字符串控制流、#8 并发字段——低成本防回归。
 4. #11 / #6 / N3 / N4——兼容性与收尾。
+
+---
+
+# Phase 1 基础层复审（2026-07-14）
+
+本次复审以实现提交 `216a1aa`、完整 Gradle 验证和 MuMu 模拟器实测为依据。
+详细命令、APK 元数据、哈希和设备断言见
+[Phase 1 基础验收证据](docs/parity/2026-07-10-phase-1-foundation-evidence.md)。
+
+| 历史发现 | 最新状态 | 代码与测试依据 |
+|---|---|---|
+| #4 帧缓冲逐字节复制 | **已修复** | `FrameBufferCopier`、`ScreenFrameStore`、`FrameBufferCopierTest` |
+| #5 ZIP 每次线性扫描 | **已修复** | `ZipAssetIndex`、`AutoWsgrAssetStore`、`ZipAssetIndexTest` |
+| #8 stepper waiter/running 竞争 | **已修复** | `WaiterLifecycle`、`GuardedStepperLifecycleTest`、`Task5RunnerSafetyTest` |
+| #9 状态文案驱动控制流 | **已修复** | `StepOutcome`、`AutomationOutcome`、`GuardedStepOutcomeTest`、旧契约源码检查 |
+
+验证结果为 15 个测试套件、99 个测试、0 失败、0 错误；Android Lint 为
+0 error / 40 warning。模拟器上同时确认了活动流程互斥以及停止后的
+`CANCELLED` 终态。
+
+仍需后续阶段处理的主要项目：#6、#7、#10、#11、#12，以及端侧 OCR、统一页面
+注册与 BFS 导航。Phase 1 复审不构成 95% 功能对等结论。
