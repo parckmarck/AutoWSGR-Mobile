@@ -448,6 +448,43 @@ public final class Task5RunnerSafetyTest {
         assertTrue(childCancelled.get());
     }
 
+    @Test public void guardedChildTerminalTimeoutRetainsBudgetAcrossPause() throws Exception {
+        AutomationSession session = new AutomationSession(
+                "guarded", "parent-paused-timeout", new AutomationControl(), new EmptySink(),
+                update -> { }
+        );
+        CountDownLatch childPolled = new CountDownLatch(1);
+        AtomicBoolean childCancelled = new AtomicBoolean();
+        GuardedCombatRunner.ChildState stuckChild = new GuardedCombatRunner.ChildState() {
+            @Override public boolean start() { return true; }
+            @Override public boolean isRunning() {
+                childPolled.countDown();
+                return true;
+            }
+            @Override public void cancel() { childCancelled.set(true); }
+        };
+        AtomicReference<GuardedCombatStepper.Update> result = new AtomicReference<>();
+        Thread awaiting = new Thread(() -> result.set(
+                new GuardedCombatRunner.StepResult().await(session, stuckChild, 160L, 5L)
+        ), "guarded-child-paused-timeout");
+
+        awaiting.start();
+        assertTrue(childPolled.await(1L, TimeUnit.SECONDS));
+        session.pause();
+        Thread.sleep(220L);
+        assertTrue("pause longer than timeout must remain nonterminal", awaiting.isAlive());
+
+        session.resume();
+        Thread.sleep(60L);
+        assertTrue("resume must retain the unused active-time budget", awaiting.isAlive());
+        awaiting.join(1000L);
+
+        assertFalse(awaiting.isAlive());
+        assertNotNull(result.get());
+        assertEquals(GuardedCombatStepper.StepOutcome.FAILED, result.get().outcome);
+        assertTrue(childCancelled.get());
+    }
+
     @Test public void dockFullEvidenceIsTerminalAndNeverPermitsGesture() {
         AtomicInteger gestures = new AtomicInteger();
 

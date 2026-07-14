@@ -175,6 +175,10 @@ final class AutomationSession {
         return control.paused();
     }
 
+    long activeTimeNanos() {
+        return control.activeTimeNanos();
+    }
+
     private void append(AutomationOutcome outcome, String message, String detail) {
         try {
             sink.append(MinimumRunLogStore.line(

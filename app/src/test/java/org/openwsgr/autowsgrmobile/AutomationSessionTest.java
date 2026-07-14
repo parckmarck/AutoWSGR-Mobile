@@ -9,6 +9,7 @@ import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.assertEquals;
@@ -18,6 +19,36 @@ import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 
 public final class AutomationSessionTest {
+    @Test public void activeTimeExcludesPausedDurationIncludingCancellationWhilePaused() {
+        AtomicLong clockNanos = new AtomicLong(TimeUnit.MILLISECONDS.toNanos(100L));
+        AutomationControl control = new AutomationControl(clockNanos::get);
+        long startedAtNanos = control.activeTimeNanos();
+
+        clockNanos.addAndGet(TimeUnit.MILLISECONDS.toNanos(5L));
+        assertEquals(5L, TimeUnit.NANOSECONDS.toMillis(
+                control.activeTimeNanos() - startedAtNanos
+        ));
+
+        control.pause();
+        clockNanos.addAndGet(TimeUnit.MILLISECONDS.toNanos(200L));
+        assertEquals(5L, TimeUnit.NANOSECONDS.toMillis(
+                control.activeTimeNanos() - startedAtNanos
+        ));
+
+        control.resume();
+        clockNanos.addAndGet(TimeUnit.MILLISECONDS.toNanos(7L));
+        assertEquals(12L, TimeUnit.NANOSECONDS.toMillis(
+                control.activeTimeNanos() - startedAtNanos
+        ));
+
+        control.pause();
+        clockNanos.addAndGet(TimeUnit.MILLISECONDS.toNanos(300L));
+        control.cancel();
+        assertEquals(12L, TimeUnit.NANOSECONDS.toMillis(
+                control.activeTimeNanos() - startedAtNanos
+        ));
+    }
+
     @Test public void pausedControlBlocksCheckpointUntilResume() throws Exception {
         AutomationControl control = new AutomationControl();
         control.pause();

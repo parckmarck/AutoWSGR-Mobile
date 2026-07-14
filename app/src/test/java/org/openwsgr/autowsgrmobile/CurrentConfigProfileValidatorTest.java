@@ -80,6 +80,22 @@ public final class CurrentConfigProfileValidatorTest {
         );
     }
 
+    @Test public void orphanIndentationAndIndentationBelowScalarAreRejectedWithLocation() {
+        IOException orphan = assertThrows(
+                IOException.class,
+                () -> validator.validate("orphan-indent.yaml", "  campaign:\n    times: 1\n")
+        );
+        assertTrue(orphan.getMessage().contains("orphan-indent.yaml"));
+        assertTrue(orphan.getMessage().contains("line 1"));
+
+        IOException belowScalar = assertThrows(
+                IOException.class,
+                () -> validator.validate("scalar-indent.yaml", "version: 1\n  campaign:\n")
+        );
+        assertTrue(belowScalar.getMessage().contains("scalar-indent.yaml"));
+        assertTrue(belowScalar.getMessage().contains("line 2"));
+    }
+
     @Test public void quotedScalarColonsAndHashesRemainValid() throws Exception {
         String yaml = "version: 1\n"
                 + "profile_name: \"每日: #一号\" # trailing comment\n"

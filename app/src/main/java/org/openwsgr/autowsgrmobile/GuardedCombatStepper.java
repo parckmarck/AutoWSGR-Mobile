@@ -202,7 +202,7 @@ final class GuardedCombatStepper {
     private final boolean executeGesture;
     private final ActionSpec spec;
     private final String planDetail;
-    private final AutomationControl control = new AutomationControl();
+    private final AutomationControl control;
     private final OneShotStartGate startGate = new OneShotStartGate();
     private final WaiterLifecycle waiterLifecycle = new WaiterLifecycle();
     private final PublicationGate publicationGate = new PublicationGate();
@@ -213,6 +213,7 @@ final class GuardedCombatStepper {
             ActionSpec spec,
             boolean dryRun,
             boolean executeGesture,
+            AutomationControl control,
             Callback callback
     ) {
         this.appContext = context.getApplicationContext();
@@ -221,6 +222,7 @@ final class GuardedCombatStepper {
         this.spec = spec;
         this.dryRun = dryRun;
         this.executeGesture = executeGesture;
+        this.control = control;
         this.planDetail = buildPlan();
     }
 
@@ -313,11 +315,20 @@ final class GuardedCombatStepper {
             String actionId,
             Callback callback
     ) {
+        return executeGuardedForActionId(context, actionId, new AutomationControl(), callback);
+    }
+
+    static GuardedCombatStepper executeGuardedForActionId(
+            Context context,
+            String actionId,
+            AutomationControl control,
+            Callback callback
+    ) {
         ActionSpec spec = specForActionId(actionId);
         if (spec == null) {
             return null;
         }
-        return executeGuarded(context, spec, callback);
+        return executeGuarded(context, spec, control, callback);
     }
 
     static NativeCombatPhase[] guardedPhases() {
@@ -445,7 +456,9 @@ final class GuardedCombatStepper {
             ActionSpec spec,
             Callback callback
     ) {
-        return new GuardedCombatStepper(context, spec, true, false, callback);
+        return new GuardedCombatStepper(
+                context, spec, true, false, new AutomationControl(), callback
+        );
     }
 
     private static GuardedCombatStepper executeGuarded(
@@ -453,7 +466,16 @@ final class GuardedCombatStepper {
             ActionSpec spec,
             Callback callback
     ) {
-        return new GuardedCombatStepper(context, spec, false, true, callback);
+        return executeGuarded(context, spec, new AutomationControl(), callback);
+    }
+
+    private static GuardedCombatStepper executeGuarded(
+            Context context,
+            ActionSpec spec,
+            AutomationControl control,
+            Callback callback
+    ) {
+        return new GuardedCombatStepper(context, spec, false, true, control, callback);
     }
 
     boolean start() {
@@ -555,7 +577,7 @@ final class GuardedCombatStepper {
             ));
 
             NativeCombatRecognizer.Recognition recognition = recognizeGuardPhase();
-            if (control.cancelled()) {
+            if (!checkpoint()) {
                 finish(StepOutcome.CANCELLED, "Guarded stepper: cancelled", planDetail + "\nphaseGuard=cancelled");
                 return;
             }
@@ -718,7 +740,8 @@ final class GuardedCombatStepper {
                 },
                 spec.waitScenarioId,
                 spec.waitCurrent,
-                spec.lastAction
+                spec.lastAction,
+                control
         );
         WaiterHandle handle = new WaiterHandle() {
             @Override public boolean start() {
@@ -969,11 +992,16 @@ final class GuardedCombatStepper {
     }
 
     private final class PhaseGuardDeadline implements TemplateMatcher.ScanControl {
-        private final long startedAtMs = SystemClock.elapsedRealtime();
+        private final long startedAtNanos = control.activeTimeNanos();
 
         @Override
         public boolean shouldStop() {
-            return control.cancelled() || SystemClock.elapsedRealtime() - startedAtMs >= PHASE_GUARD_TIMEOUT_MS;
+            if (!checkpoint()) {
+                return true;
+            }
+            return java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(
+                    control.activeTimeNanos() - startedAtNanos
+            ) >= PHASE_GUARD_TIMEOUT_MS;
         }
 
         @Override

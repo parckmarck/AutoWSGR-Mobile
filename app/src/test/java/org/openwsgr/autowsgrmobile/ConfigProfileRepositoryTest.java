@@ -46,6 +46,41 @@ public final class ConfigProfileRepositoryTest {
         assertEquals("automation:\n  tasks: []\n", repository(dir).loadActive().profile.yaml);
     }
 
+    @Test public void malformedIndentedSaveAsCreatesNoFileAndKeepsActiveProfile() throws Exception {
+        File dir = temporaryFolder.newFolder("malformed-save-as");
+        FileActiveProfileStore activeStore = new FileActiveProfileStore(
+                new File(dir, "active-profile.txt")
+        );
+        ConfigProfileRepository repo = new ConfigProfileRepository(
+                dir,
+                DefaultUnifiedConfig.text(),
+                activeStore,
+                new CurrentConfigProfileValidator()
+        );
+        ConfigProfile active = repo.saveAs(
+                "active",
+                "version: 1\nupstream_unknown:\n  keep: true\n",
+                true,
+                false
+        );
+
+        IOException malformed = assertThrows(
+                IOException.class,
+                () -> repo.saveAs(
+                        "malformed",
+                        "version: 1\n  campaign:\n    times: 1\n",
+                        true,
+                        false
+                )
+        );
+
+        assertTrue(malformed.getMessage().contains("malformed.yaml"));
+        assertTrue(malformed.getMessage().contains("line 2"));
+        assertFalse(new File(dir, "malformed.yaml").exists());
+        assertEquals(active.id, activeStore.load());
+        assertEquals(active.id, repo.loadActive().profile.id);
+    }
+
     @Test public void pathTraversalAndImplicitOverwriteAreRejected() throws Exception {
         ConfigProfileRepository repo = repository(temporaryFolder.newFolder("safe"));
         try {

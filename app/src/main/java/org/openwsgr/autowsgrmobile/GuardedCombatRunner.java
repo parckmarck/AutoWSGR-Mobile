@@ -2,7 +2,6 @@ package org.openwsgr.autowsgrmobile;
 
 import android.content.Context;
 import android.graphics.Bitmap;
-import android.os.SystemClock;
 
 import org.openwsgr.autowsgrmobile.vision.TemplateMatcher;
 
@@ -17,6 +16,7 @@ final class GuardedCombatRunner {
     private static final long CHILD_TERMINAL_POLL_MS = 250L;
 
     private final Context appContext;
+    private final AutomationControl control;
     private final AutomationSession session;
     private final OneShotStartGate startGate = new OneShotStartGate();
     private final int maxSteps;
@@ -38,7 +38,8 @@ final class GuardedCombatRunner {
     ) {
         this.appContext = context.getApplicationContext();
         String runId = String.valueOf(System.currentTimeMillis());
-        this.session = new AutomationSession("guarded", runId, new AutomationControl(),
+        this.control = new AutomationControl();
+        this.session = new AutomationSession("guarded", runId, control,
                 AndroidAutomationSessionSink.create(appContext, "guarded-combat", runId), callback);
         this.maxSteps = Math.max(1, maxSteps);
         this.planPolicy = selectedPolicy == null ? loadDefaultPolicy() : selectedPolicy;
@@ -182,16 +183,10 @@ final class GuardedCombatRunner {
 
     synchronized void pause() {
         session.pause();
-        if (activeStepper != null) {
-            activeStepper.pause();
-        }
     }
 
     synchronized void resume() {
         session.resume();
-        if (activeStepper != null) {
-            activeStepper.resume();
-        }
     }
 
     synchronized boolean isRunning() {
@@ -234,7 +229,7 @@ final class GuardedCombatRunner {
             );
 
             NativeCombatRecognizer.Recognition recognition = recognizeGuardablePhase();
-            if (session.cancelled()) {
+            if (!session.checkpoint()) {
                 finish(AutomationOutcome.CANCELLED, "Guarded runner: cancelled", runnerPlan + "\nstepsCompleted=" + completedSteps + "\nphaseScan=cancelled", false);
                 return;
             }
@@ -282,6 +277,7 @@ final class GuardedCombatRunner {
             GuardedCombatStepper stepper = GuardedCombatStepper.executeGuardedForActionId(
                     appContext,
                     actionId,
+                    control,
                     stepperCallback(stepIndex, recognition, actionId, routeDetail, planDecisionDetail, stepResult)
             );
             if (stepper == null) {
@@ -744,11 +740,16 @@ final class GuardedCombatRunner {
     }
 
     private final class PhaseScanDeadline implements TemplateMatcher.ScanControl {
-        private final long startedAtMs = SystemClock.elapsedRealtime();
+        private final long startedAtNanos = session.activeTimeNanos();
 
         @Override
         public boolean shouldStop() {
-            return session.cancelled() || SystemClock.elapsedRealtime() - startedAtMs >= PHASE_SCAN_TIMEOUT_MS;
+            if (!session.checkpoint()) {
+                return true;
+            }
+            return TimeUnit.NANOSECONDS.toMillis(
+                    session.activeTimeNanos() - startedAtNanos
+            ) >= PHASE_SCAN_TIMEOUT_MS;
         }
 
         @Override
@@ -780,7 +781,7 @@ final class GuardedCombatRunner {
                                           long timeoutMs, long pollMs) {
             long safeTimeoutMs = Math.max(1L, timeoutMs);
             long safePollMs = Math.max(1L, pollMs);
-            long startedAtNanos = System.nanoTime();
+            long startedAtNanos = session.activeTimeNanos();
             long stoppedAtNanos = -1L;
             while (!session.cancelled()) {
                 if (!session.checkpoint()) {
@@ -792,7 +793,8 @@ final class GuardedCombatRunner {
                     }
                 }
 
-                long elapsedMs = elapsedMs(startedAtNanos);
+                long activeNowNanos = session.activeTimeNanos();
+                long elapsedMs = elapsedMs(activeNowNanos - startedAtNanos);
                 if (elapsedMs >= safeTimeoutMs) {
                     child.cancel();
                     return GuardedCombatStepper.Update.terminal(
@@ -803,11 +805,10 @@ final class GuardedCombatRunner {
                 }
 
                 if (!child.isRunning()) {
-                    long nowNanos = System.nanoTime();
                     if (stoppedAtNanos < 0L) {
-                        stoppedAtNanos = nowNanos;
+                        stoppedAtNanos = activeNowNanos;
                     } else {
-                        long stoppedMs = TimeUnit.NANOSECONDS.toMillis(nowNanos - stoppedAtNanos);
+                        long stoppedMs = elapsedMs(activeNowNanos - stoppedAtNanos);
                         long graceMs = Math.max(50L, safePollMs * 2L);
                         if (stoppedMs >= graceMs) {
                             return GuardedCombatStepper.Update.terminal(
@@ -836,8 +837,8 @@ final class GuardedCombatRunner {
             return update;
         }
 
-        private static long elapsedMs(long startedAtNanos) {
-            return TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedAtNanos);
+        private static long elapsedMs(long elapsedNanos) {
+            return TimeUnit.NANOSECONDS.toMillis(elapsedNanos);
         }
 
         synchronized void finish(GuardedCombatStepper.Update update) {

@@ -33,6 +33,9 @@ final class YamlSectionExtractor {
                 if (currentKey != null && !currentScalar) {
                     int dedent = Math.min(2, indentation);
                     currentBody.append(line.substring(dedent)).append('\n');
+                } else if (!line.trim().startsWith("#")) {
+                    throw new IOException(location + ": invalid indentation at line "
+                            + (index + 1));
                 }
                 continue;
             }
