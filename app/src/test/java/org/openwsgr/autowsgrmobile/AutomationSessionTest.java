@@ -49,6 +49,62 @@ public final class AutomationSessionTest {
         ));
     }
 
+    @Test public void childControlSharesParentPauseButOwnsCancellation() throws Exception {
+        AutomationControl parent = new AutomationControl();
+        AutomationControl child = parent.childControl();
+        parent.pause();
+        CountDownLatch entered = new CountDownLatch(1);
+        AtomicReference<Boolean> result = new AtomicReference<>();
+        Thread worker = new Thread(() -> {
+            entered.countDown();
+            try {
+                result.set(child.checkpoint());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "child-control-parent-pause");
+
+        worker.start();
+        assertTrue(entered.await(1, TimeUnit.SECONDS));
+        Thread.sleep(100L);
+        assertNull("the child must observe its parent's pause", result.get());
+
+        child.cancel();
+        worker.join(1000L);
+
+        assertFalse(worker.isAlive());
+        assertEquals(Boolean.FALSE, result.get());
+        assertFalse("child cancellation must not cancel its parent", parent.cancelled());
+        assertTrue("child cancellation must not resume its parent", parent.paused());
+        parent.resume();
+    }
+
+    @Test public void parentCancellationPropagatesToPausedChildControl() throws Exception {
+        AutomationControl parent = new AutomationControl();
+        AutomationControl child = parent.childControl();
+        parent.pause();
+        CountDownLatch entered = new CountDownLatch(1);
+        AtomicReference<Boolean> result = new AtomicReference<>();
+        Thread worker = new Thread(() -> {
+            entered.countDown();
+            try {
+                result.set(child.checkpoint());
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }, "parent-cancel-child-control");
+
+        worker.start();
+        assertTrue(entered.await(1, TimeUnit.SECONDS));
+        Thread.sleep(100L);
+        parent.cancel();
+        worker.join(1000L);
+
+        assertFalse(worker.isAlive());
+        assertEquals(Boolean.FALSE, result.get());
+        assertTrue(child.cancelled());
+    }
+
     @Test public void pausedControlBlocksCheckpointUntilResume() throws Exception {
         AutomationControl control = new AutomationControl();
         control.pause();

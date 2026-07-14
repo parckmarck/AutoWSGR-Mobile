@@ -427,16 +427,17 @@ public final class Task5RunnerSafetyTest {
         assertEquals(0, childStarts.get());
     }
 
-    @Test public void guardedChildTerminalTimeoutCancelsChildAndFailsClosed() {
+    @Test public void guardedChildTerminalTimeoutCancelsOnlyChildAndPublishesFailed() {
+        AutomationControl parentControl = new AutomationControl();
+        AutomationControl childControl = parentControl.childControl();
+        List<AutomationUpdate> updates = new ArrayList<>();
         AutomationSession session = new AutomationSession(
-                "guarded", "parent-timeout", new AutomationControl(), new EmptySink(),
-                update -> { }
+                "guarded", "parent-timeout", parentControl, new EmptySink(), updates::add
         );
-        AtomicBoolean childCancelled = new AtomicBoolean();
         GuardedCombatRunner.ChildState stuckChild = new GuardedCombatRunner.ChildState() {
             @Override public boolean start() { return true; }
             @Override public boolean isRunning() { return true; }
-            @Override public void cancel() { childCancelled.set(true); }
+            @Override public void cancel() { childControl.cancel(); }
         };
 
         GuardedCombatStepper.Update update = new GuardedCombatRunner.StepResult().await(
@@ -445,7 +446,15 @@ public final class Task5RunnerSafetyTest {
 
         assertNotNull(update);
         assertEquals(GuardedCombatStepper.StepOutcome.FAILED, update.outcome);
-        assertTrue(childCancelled.get());
+        assertTrue(childControl.cancelled());
+        assertFalse("child timeout cancellation must not cancel the parent session",
+                session.cancelled());
+        assertTrue(session.finish(
+                AutomationOutcome.FAILED, update.status, update.detail, true
+        ));
+        assertEquals(1, updates.size());
+        assertEquals("the parent must retain the typed child-timeout failure",
+                AutomationOutcome.FAILED, updates.get(0).outcome);
     }
 
     @Test public void guardedChildTerminalTimeoutRetainsBudgetAcrossPause() throws Exception {

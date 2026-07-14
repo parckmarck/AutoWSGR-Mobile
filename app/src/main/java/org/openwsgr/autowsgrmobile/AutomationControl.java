@@ -9,11 +9,9 @@ final class AutomationControl {
         boolean run();
     }
 
-    private final TimeSource timeSource;
-    private boolean paused;
+    private final SharedState sharedState;
+    private final AutomationControl parent;
     private boolean cancelled;
-    private long pausedAtNanos;
-    private long pausedDurationNanos;
 
     AutomationControl() {
         this(new TimeSource() {
@@ -27,69 +25,113 @@ final class AutomationControl {
         if (timeSource == null) {
             throw new IllegalArgumentException("time source is required");
         }
-        this.timeSource = timeSource;
+        this.sharedState = new SharedState(timeSource);
+        this.parent = null;
     }
 
-    synchronized void pause() {
-        if (!cancelled && !paused) {
-            paused = true;
-            pausedAtNanos = timeSource.nanoTime();
+    private AutomationControl(SharedState sharedState, AutomationControl parent) {
+        this.sharedState = sharedState;
+        this.parent = parent;
+    }
+
+    AutomationControl childControl() {
+        return new AutomationControl(sharedState, this);
+    }
+
+    void pause() {
+        synchronized (sharedState) {
+            if (!cancelledLocked() && !sharedState.paused) {
+                sharedState.paused = true;
+                sharedState.pausedAtNanos = sharedState.timeSource.nanoTime();
+            }
         }
     }
 
-    synchronized void resume() {
-        finishPause();
-        paused = false;
-        notifyAll();
-    }
-
-    synchronized void cancel() {
-        cancelled = true;
-        finishPause();
-        paused = false;
-        notifyAll();
-    }
-
-    synchronized boolean cancelled() {
-        return cancelled;
-    }
-
-    synchronized boolean paused() {
-        return paused;
-    }
-
-    synchronized long activeTimeNanos() {
-        long now = paused ? pausedAtNanos : timeSource.nanoTime();
-        return now - pausedDurationNanos;
-    }
-
-    synchronized boolean checkpoint() throws InterruptedException {
-        while (paused && !cancelled) {
-            wait();
+    void resume() {
+        synchronized (sharedState) {
+            finishPauseLocked();
+            sharedState.paused = false;
+            sharedState.notifyAll();
         }
-        return !cancelled;
     }
 
-    synchronized boolean performAction(Action action) throws InterruptedException {
+    void cancel() {
+        synchronized (sharedState) {
+            cancelled = true;
+            if (parent == null) {
+                finishPauseLocked();
+                sharedState.paused = false;
+            }
+            sharedState.notifyAll();
+        }
+    }
+
+    boolean cancelled() {
+        synchronized (sharedState) {
+            return cancelledLocked();
+        }
+    }
+
+    boolean paused() {
+        synchronized (sharedState) {
+            return sharedState.paused;
+        }
+    }
+
+    long activeTimeNanos() {
+        synchronized (sharedState) {
+            long now = sharedState.paused
+                    ? sharedState.pausedAtNanos : sharedState.timeSource.nanoTime();
+            return now - sharedState.pausedDurationNanos;
+        }
+    }
+
+    boolean checkpoint() throws InterruptedException {
+        synchronized (sharedState) {
+            while (sharedState.paused && !cancelledLocked()) {
+                sharedState.wait();
+            }
+            return !cancelledLocked();
+        }
+    }
+
+    boolean performAction(Action action) throws InterruptedException {
         if (action == null) {
             throw new IllegalArgumentException("action is required");
         }
-        while (paused && !cancelled) {
-            wait();
+        synchronized (sharedState) {
+            while (sharedState.paused && !cancelledLocked()) {
+                sharedState.wait();
+            }
+            if (cancelledLocked()) {
+                return false;
+            }
+            return action.run();
         }
-        if (cancelled) {
-            return false;
-        }
-        return action.run();
     }
 
-    private void finishPause() {
-        if (!paused) {
+    private boolean cancelledLocked() {
+        return cancelled || (parent != null && parent.cancelledLocked());
+    }
+
+    private void finishPauseLocked() {
+        if (!sharedState.paused) {
             return;
         }
-        long pausedNanos = timeSource.nanoTime() - pausedAtNanos;
+        long pausedNanos = sharedState.timeSource.nanoTime() - sharedState.pausedAtNanos;
         if (pausedNanos > 0L) {
-            pausedDurationNanos += pausedNanos;
+            sharedState.pausedDurationNanos += pausedNanos;
+        }
+    }
+
+    private static final class SharedState {
+        final TimeSource timeSource;
+        boolean paused;
+        long pausedAtNanos;
+        long pausedDurationNanos;
+
+        SharedState(TimeSource timeSource) {
+            this.timeSource = timeSource;
         }
     }
 }

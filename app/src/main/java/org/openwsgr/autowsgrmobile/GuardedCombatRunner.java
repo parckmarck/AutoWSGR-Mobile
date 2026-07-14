@@ -274,10 +274,11 @@ final class GuardedCombatRunner {
                     + "\n" + enemyScan.detail
                     + "\n" + planDecision.detail();
             StepResult stepResult = new StepResult();
+            AutomationControl childControl = control.childControl();
             GuardedCombatStepper stepper = GuardedCombatStepper.executeGuardedForActionId(
                     appContext,
                     actionId,
-                    control,
+                    childControl,
                     stepperCallback(stepIndex, recognition, actionId, routeDetail, planDecisionDetail, stepResult)
             );
             if (stepper == null) {
