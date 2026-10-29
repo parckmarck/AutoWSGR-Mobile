@@ -28,8 +28,39 @@ final class CampaignBattleNavigator {
         boolean cancelled();
     }
 
+    interface TapDispatcher {
+        boolean tap(float x, float y);
+    }
+
+    interface Delay {
+        void sleep(long delayMs);
+    }
+
     interface Logger {
         void log(String status, String detail);
+    }
+
+    private final TapDispatcher tapDispatcher;
+    private final Delay delay;
+
+    CampaignBattleNavigator() {
+        this(new TapDispatcher() {
+            @Override public boolean tap(float x, float y) {
+                return AndroidControllerBridge.tap(x, y);
+            }
+        }, new Delay() {
+            @Override public void sleep(long delayMs) {
+                SystemClock.sleep(delayMs);
+            }
+        });
+    }
+
+    CampaignBattleNavigator(TapDispatcher tapDispatcher, Delay delay) {
+        if (tapDispatcher == null || delay == null) {
+            throw new IllegalArgumentException("tapDispatcher and delay are required");
+        }
+        this.tapDispatcher = tapDispatcher;
+        this.delay = delay;
     }
 
     static TapAction battlePanelTap() {
@@ -48,49 +79,85 @@ final class CampaignBattleNavigator {
     }
 
     boolean tapBattlePanel(CancelToken cancel, Logger logger) {
-        return tapGame(battlePanelTap(), cancel, logger);
+        return tapBattlePanel(cancel, directBoundary(cancel), logger);
+    }
+
+    boolean tapBattlePanel(CancelToken cancel, AutomationSession.ActionBoundary boundary,
+                           Logger logger) {
+        return tapGame(battlePanelTap(), cancel, boundary, logger);
     }
 
     boolean tapDifficultyToggle(CancelToken cancel, Logger logger) {
-        return tapGame(difficultyToggleTap(), cancel, logger);
+        return tapDifficultyToggle(cancel, directBoundary(cancel), logger);
+    }
+
+    boolean tapDifficultyToggle(CancelToken cancel, AutomationSession.ActionBoundary boundary,
+                                Logger logger) {
+        return tapGame(difficultyToggleTap(), cancel, boundary, logger);
     }
 
     boolean tapCampaign(int mapIndex, CancelToken cancel, Logger logger) {
-        return tapGame(campaignTap(mapIndex), cancel, logger);
+        return tapCampaign(mapIndex, cancel, directBoundary(cancel), logger);
+    }
+
+    boolean tapCampaign(int mapIndex, CancelToken cancel,
+                        AutomationSession.ActionBoundary boundary, Logger logger) {
+        return tapGame(campaignTap(mapIndex), cancel, boundary, logger);
     }
 
     boolean tapQuickRepairPanel(CancelToken cancel, Logger logger) {
+        return tapQuickRepairPanel(cancel, directBoundary(cancel), logger);
+    }
+
+    boolean tapQuickRepairPanel(CancelToken cancel, AutomationSession.ActionBoundary boundary,
+                                Logger logger) {
         return tapGame(new TapAction("campaign-quick-repair-panel",
-                QUICK_REPAIR_PANEL_X, QUICK_REPAIR_PANEL_Y), cancel, logger);
+                QUICK_REPAIR_PANEL_X, QUICK_REPAIR_PANEL_Y), cancel, boundary, logger);
     }
 
     boolean tapRepairSlot(int slot, CancelToken cancel, Logger logger) {
+        return tapRepairSlot(slot, cancel, directBoundary(cancel), logger);
+    }
+
+    boolean tapRepairSlot(int slot, CancelToken cancel,
+                          AutomationSession.ActionBoundary boundary, Logger logger) {
         if (slot < 0 || slot >= REPAIR_SLOTS.length) {
             return false;
         }
         return tapGame(new TapAction("campaign-repair-slot-" + slot,
-                REPAIR_SLOTS[slot][0], REPAIR_SLOTS[slot][1]), cancel, logger, WAIT_AFTER_REPAIR_TAP_MS);
+                REPAIR_SLOTS[slot][0], REPAIR_SLOTS[slot][1]), cancel, boundary, logger,
+                WAIT_AFTER_REPAIR_TAP_MS);
     }
 
-    private boolean tapGame(TapAction action, CancelToken cancel, Logger logger) {
-        return tapGame(action, cancel, logger, WAIT_AFTER_TAP_MS);
+    private boolean tapGame(TapAction action, CancelToken cancel,
+                            AutomationSession.ActionBoundary boundary, Logger logger) {
+        return tapGame(action, cancel, boundary, logger, WAIT_AFTER_TAP_MS);
     }
 
-    private boolean tapGame(TapAction action, CancelToken cancel, Logger logger, long waitMs) {
-        if (cancel.cancelled()) {
-            logger.log("cancelled", "before=" + action.name);
-            return false;
-        }
+    private boolean tapGame(TapAction action, CancelToken cancel,
+                            AutomationSession.ActionBoundary boundary, Logger logger, long waitMs) {
         float screenX = GameFrameNormalizer.mapGameX(action.gameX);
         float screenY = GameFrameNormalizer.mapGameY(action.gameY);
-        boolean tapped = AndroidControllerBridge.tap(screenX, screenY);
+        boolean tapped = boundary.perform(new AutomationSession.Action() {
+            @Override public boolean run() {
+                return tapDispatcher.tap(screenX, screenY);
+            }
+        });
         logger.log(tapped ? "tap" : "tap-failed", "action=" + action.name
                 + ", x=" + screenX + ", y=" + screenY);
         if (!tapped) {
             return false;
         }
-        SystemClock.sleep(waitMs);
+        delay.sleep(waitMs);
         return !cancel.cancelled();
+    }
+
+    private static AutomationSession.ActionBoundary directBoundary(final CancelToken cancel) {
+        return new AutomationSession.ActionBoundary() {
+            @Override public boolean perform(AutomationSession.Action action) {
+                return !cancel.cancelled() && action.run();
+            }
+        };
     }
 
     static final class TapAction {

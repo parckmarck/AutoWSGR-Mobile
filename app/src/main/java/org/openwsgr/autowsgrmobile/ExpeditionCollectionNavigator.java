@@ -23,8 +23,39 @@ final class ExpeditionCollectionNavigator {
         boolean cancelled();
     }
 
+    interface TapDispatcher {
+        boolean tap(float x, float y);
+    }
+
+    interface Delay {
+        void sleep(long delayMs);
+    }
+
     interface Logger {
         void log(String status, String detail);
+    }
+
+    private final TapDispatcher tapDispatcher;
+    private final Delay delay;
+
+    ExpeditionCollectionNavigator() {
+        this(new TapDispatcher() {
+            @Override public boolean tap(float x, float y) {
+                return AndroidControllerBridge.tap(x, y);
+            }
+        }, new Delay() {
+            @Override public void sleep(long delayMs) {
+                SystemClock.sleep(delayMs);
+            }
+        });
+    }
+
+    ExpeditionCollectionNavigator(TapDispatcher tapDispatcher, Delay delay) {
+        if (tapDispatcher == null || delay == null) {
+            throw new IllegalArgumentException("tapDispatcher and delay are required");
+        }
+        this.tapDispatcher = tapDispatcher;
+        this.delay = delay;
     }
 
     static TapAction expeditionPanelTap() {
@@ -48,44 +79,85 @@ final class ExpeditionCollectionNavigator {
     }
 
     boolean tapExpeditionPanel(CancelToken cancel, Logger logger) {
-        return tapGame(expeditionPanelTap(), cancel, logger);
+        return tapExpeditionPanel(cancel, directBoundary(cancel), logger);
+    }
+
+    boolean tapExpeditionPanel(CancelToken cancel, AutomationSession.ActionBoundary boundary,
+                               Logger logger) {
+        return tapGame(expeditionPanelTap(), cancel, boundary, logger);
     }
 
     boolean tapReadySlot(int slotIndex, CancelToken cancel, Logger logger) {
-        return tapGame(readySlotTap(slotIndex), cancel, logger);
+        return tapReadySlot(slotIndex, cancel, directBoundary(cancel), logger);
+    }
+
+    boolean tapReadySlot(int slotIndex, CancelToken cancel,
+                         AutomationSession.ActionBoundary boundary, Logger logger) {
+        return tapGame(readySlotTap(slotIndex), cancel, boundary, logger);
     }
 
     boolean tapSkipResult(CancelToken cancel, Logger logger) {
-        return tapGame(skipResultTap(), cancel, logger);
+        return tapSkipResult(cancel, directBoundary(cancel), logger);
+    }
+
+    boolean tapSkipResult(CancelToken cancel, AutomationSession.ActionBoundary boundary,
+                          Logger logger) {
+        return tapGame(skipResultTap(), cancel, boundary, logger);
     }
 
     boolean tapConfirm(CancelToken cancel, Logger logger) {
-        return tapGame(new TapAction("expedition-confirm", CONFIRM_X, CONFIRM_Y), cancel, logger);
+        return tapConfirm(cancel, directBoundary(cancel), logger);
+    }
+
+    boolean tapConfirm(CancelToken cancel, AutomationSession.ActionBoundary boundary,
+                       Logger logger) {
+        return tapGame(new TapAction("expedition-confirm", CONFIRM_X, CONFIRM_Y),
+                cancel, boundary, logger);
     }
 
     boolean tapRedispatchConfirm(CancelToken cancel, Logger logger) {
-        return tapGame(redispatchConfirmTap(), cancel, logger);
+        return tapRedispatchConfirm(cancel, directBoundary(cancel), logger);
+    }
+
+    boolean tapRedispatchConfirm(CancelToken cancel, AutomationSession.ActionBoundary boundary,
+                                 Logger logger) {
+        return tapGame(redispatchConfirmTap(), cancel, boundary, logger);
     }
 
     boolean tapReturnHome(CancelToken cancel, Logger logger) {
-        return tapGame(new TapAction("map-return-home", RETURN_HOME_X, RETURN_HOME_Y), cancel, logger);
+        return tapReturnHome(cancel, directBoundary(cancel), logger);
     }
 
-    private boolean tapGame(TapAction action, CancelToken cancel, Logger logger) {
-        if (cancel.cancelled()) {
-            logger.log("cancelled", "before=" + action.name);
-            return false;
-        }
+    boolean tapReturnHome(CancelToken cancel, AutomationSession.ActionBoundary boundary,
+                          Logger logger) {
+        return tapGame(new TapAction("map-return-home", RETURN_HOME_X, RETURN_HOME_Y),
+                cancel, boundary, logger);
+    }
+
+    private boolean tapGame(TapAction action, CancelToken cancel,
+                            AutomationSession.ActionBoundary boundary, Logger logger) {
         float screenX = GameFrameNormalizer.mapGameX(action.gameX);
         float screenY = GameFrameNormalizer.mapGameY(action.gameY);
-        boolean tapped = AndroidControllerBridge.tap(screenX, screenY);
+        boolean tapped = boundary.perform(new AutomationSession.Action() {
+            @Override public boolean run() {
+                return tapDispatcher.tap(screenX, screenY);
+            }
+        });
         logger.log(tapped ? "tap" : "tap-failed", "action=" + action.name
                 + ", x=" + screenX + ", y=" + screenY);
         if (!tapped) {
             return false;
         }
-        SystemClock.sleep(WAIT_AFTER_TAP_MS);
+        delay.sleep(WAIT_AFTER_TAP_MS);
         return !cancel.cancelled();
+    }
+
+    private static AutomationSession.ActionBoundary directBoundary(final CancelToken cancel) {
+        return new AutomationSession.ActionBoundary() {
+            @Override public boolean perform(AutomationSession.Action action) {
+                return !cancel.cancelled() && action.run();
+            }
+        };
     }
 
     static final class TapAction {
