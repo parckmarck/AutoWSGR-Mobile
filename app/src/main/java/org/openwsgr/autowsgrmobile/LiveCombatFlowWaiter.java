@@ -4,15 +4,23 @@ import android.content.Context;
 import android.graphics.Bitmap;
 import android.os.Handler;
 import android.os.Looper;
-import android.os.SystemClock;
 
 import org.openwsgr.autowsgrmobile.vision.TemplateMatcher;
 
 import java.util.Locale;
+import java.util.concurrent.TimeUnit;
 
 final class LiveCombatFlowWaiter {
     interface Callback {
         void onUpdate(Update update);
+    }
+
+    interface WorkerOperation {
+        void run();
+    }
+
+    interface UpdateEmitter {
+        void emit(Update update);
     }
 
     private static final long DEFAULT_TIMEOUT_MS = 6000L;
@@ -32,9 +40,12 @@ final class LiveCombatFlowWaiter {
     private final long pollIntervalMs;
     private final int stride;
     private final double threshold;
+    private final AutomationControl control;
 
     private volatile boolean cancelled;
     private volatile boolean running;
+    private final OneShotStartGate startGate = new OneShotStartGate();
+    private boolean terminalPosted;
     private Thread worker;
 
     private LiveCombatFlowWaiter(
@@ -47,7 +58,8 @@ final class LiveCombatFlowWaiter {
             long timeoutMs,
             long pollIntervalMs,
             int stride,
-            double threshold
+            double threshold,
+            AutomationControl control
     ) {
         this.appContext = context.getApplicationContext();
         this.mainHandler = new Handler(Looper.getMainLooper());
@@ -60,6 +72,7 @@ final class LiveCombatFlowWaiter {
         this.pollIntervalMs = pollIntervalMs;
         this.stride = stride;
         this.threshold = threshold;
+        this.control = control;
     }
 
     static LiveCombatFlowWaiter mapSpotFight(Context context, Callback callback) {
@@ -88,12 +101,36 @@ final class LiveCombatFlowWaiter {
         return mapScenario(context, callback, scenarioId, current, lastAction);
     }
 
+    static LiveCombatFlowWaiter mapCustom(
+            Context context,
+            Callback callback,
+            String scenarioId,
+            NativeCombatPhase current,
+            String lastAction,
+            AutomationControl control
+    ) {
+        return mapScenario(context, callback, scenarioId, current, lastAction, control);
+    }
+
     private static LiveCombatFlowWaiter mapScenario(
             Context context,
             Callback callback,
             String scenarioId,
             NativeCombatPhase current,
             String lastAction
+    ) {
+        return mapScenario(
+                context, callback, scenarioId, current, lastAction, new AutomationControl()
+        );
+    }
+
+    private static LiveCombatFlowWaiter mapScenario(
+            Context context,
+            Callback callback,
+            String scenarioId,
+            NativeCombatPhase current,
+            String lastAction,
+            AutomationControl control
     ) {
         return new LiveCombatFlowWaiter(
                 context,
@@ -108,20 +145,37 @@ final class LiveCombatFlowWaiter {
                 DEFAULT_TIMEOUT_MS,
                 DEFAULT_POLL_INTERVAL_MS,
                 DEFAULT_STRIDE,
-                DEFAULT_THRESHOLD
+                DEFAULT_THRESHOLD,
+                control
         );
     }
 
     synchronized boolean start() {
-        if (running) {
+        OneShotStartGate.Decision decision = startGate.claim(cancelled);
+        if (decision == OneShotStartGate.Decision.REJECTED) {
             return false;
         }
-        cancelled = false;
+        if (decision == OneShotStartGate.Decision.PRE_CANCELLED) {
+            post(Update.cancelled(0, 0L, "preStart=cancelled"));
+            return true;
+        }
         running = true;
         worker = new Thread(new Runnable() {
             @Override
             public void run() {
-                runLoop();
+                try {
+                    runWorkerBoundary(new WorkerOperation() {
+                        @Override public void run() {
+                            runLoop();
+                        }
+                    }, new UpdateEmitter() {
+                        @Override public void emit(Update update) {
+                            post(update);
+                        }
+                    });
+                } finally {
+                    running = false;
+                }
             }
         }, "AutoWSGR-live-combat-wait");
         worker.setPriority(Thread.MIN_PRIORITY);
@@ -129,8 +183,9 @@ final class LiveCombatFlowWaiter {
         return true;
     }
 
-    void cancel() {
+    synchronized void cancel() {
         cancelled = true;
+        control.cancel();
         Thread active = worker;
         if (active != null) {
             active.interrupt();
@@ -144,17 +199,18 @@ final class LiveCombatFlowWaiter {
     private void runLoop() {
         AutoWsgrAssetStore store = new AutoWsgrAssetStore(appContext);
         NativeCombatPhase[] candidates = graph.successors(current, lastAction);
-        long startedAtMs = SystemClock.elapsedRealtime();
+        long startedAtNanos = control.activeTimeNanos();
         int attempts = 0;
         post(Update.progress(attempts, 0L, startDetail(candidates)));
 
         try {
             while (true) {
-                long elapsedMs = SystemClock.elapsedRealtime() - startedAtMs;
-                if (cancelled) {
+                if (!checkpoint()) {
+                    long elapsedMs = activeElapsedMs(startedAtNanos);
                     post(Update.cancelled(attempts, elapsedMs, "cancel requested"));
                     return;
                 }
+                long elapsedMs = activeElapsedMs(startedAtNanos);
                 boolean finalAttempt = shouldAttemptFinalScanAtTimeout(elapsedMs, timeoutMs);
 
                 Bitmap liveFrame = ScreenFrameStore.latestBitmap();
@@ -171,7 +227,7 @@ final class LiveCombatFlowWaiter {
                 }
 
                 ScanDeadline deadline = new ScanDeadline(
-                        startedAtMs,
+                        startedAtNanos,
                         finalAttempt ? finalScanDeadlineElapsedMs(timeoutMs) : timeoutMs
                 );
                 NativeCombatRecognizer.Recognition recognition;
@@ -186,10 +242,15 @@ final class LiveCombatFlowWaiter {
                             threshold,
                             deadline
                     );
-                    elapsedMs = SystemClock.elapsedRealtime() - startedAtMs;
+                    if (!checkpoint()) {
+                        elapsedMs = activeElapsedMs(startedAtNanos);
+                        post(Update.cancelled(attempts, elapsedMs, "cancel requested during scan"));
+                        return;
+                    }
+                    elapsedMs = activeElapsedMs(startedAtNanos);
                     String detail = attemptDetail(candidates, scanFrame, recognition, attempts, elapsedMs, finalAttempt);
 
-                    if (cancelled) {
+                    if (control.cancelled()) {
                         post(Update.cancelled(attempts, elapsedMs, detail));
                         return;
                     }
@@ -213,6 +274,21 @@ final class LiveCombatFlowWaiter {
             }
         } finally {
             running = false;
+        }
+    }
+
+    static void runWorkerBoundary(WorkerOperation operation, UpdateEmitter emitter) {
+        if (operation == null || emitter == null) {
+            throw new IllegalArgumentException("operation and emitter are required");
+        }
+        try {
+            operation.run();
+        } catch (Throwable failure) {
+            emitter.emit(Update.failed(
+                    0,
+                    0L,
+                    "worker-exception=" + failure.getClass().getName() + ": " + failure.getMessage()
+            ));
         }
     }
 
@@ -291,13 +367,56 @@ final class LiveCombatFlowWaiter {
         }
     }
 
-    private void post(final Update update) {
-        mainHandler.post(new Runnable() {
+    private boolean checkpoint() {
+        try {
+            return control.checkpoint();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    private long activeElapsedMs(long startedAtNanos) {
+        return TimeUnit.NANOSECONDS.toMillis(control.activeTimeNanos() - startedAtNanos);
+    }
+
+    private void post(Update update) {
+        synchronized (this) {
+            boolean cancellationRequested = cancelled || control.cancelled();
+            if (update.running) {
+                if (cancellationRequested || terminalPosted) {
+                    return;
+                }
+            } else {
+                if (terminalPosted) {
+                    return;
+                }
+                if (cancellationRequested && !update.cancelled) {
+                    update = Update.cancelled(
+                            update.attempts,
+                            update.elapsedMs,
+                            update.detail + "\ncancellation=won terminal race"
+                    );
+                }
+                terminalPosted = true;
+            }
+        }
+        final Update deliveryUpdate = update;
+        Runnable delivery = new Runnable() {
             @Override
             public void run() {
-                callback.onUpdate(update);
+                callback.onUpdate(deliveryUpdate);
             }
-        });
+        };
+        boolean posted;
+        try {
+            posted = mainHandler.post(delivery);
+        } catch (RuntimeException handlerFailure) {
+            posted = false;
+        }
+        if (!posted) {
+            delivery.run();
+        }
     }
 
     private static String formatRecognition(NativeCombatRecognizer.Recognition recognition) {
@@ -332,21 +451,21 @@ final class LiveCombatFlowWaiter {
     }
 
     private final class ScanDeadline implements TemplateMatcher.ScanControl {
-        private final long startedAtMs;
+        private final long startedAtNanos;
         private final long deadlineElapsedMs;
         private boolean timedOut;
 
-        ScanDeadline(long startedAtMs, long deadlineElapsedMs) {
-            this.startedAtMs = startedAtMs;
+        ScanDeadline(long startedAtNanos, long deadlineElapsedMs) {
+            this.startedAtNanos = startedAtNanos;
             this.deadlineElapsedMs = deadlineElapsedMs;
         }
 
         @Override
         public boolean shouldStop() {
-            if (cancelled) {
+            if (!checkpoint()) {
                 return true;
             }
-            if (SystemClock.elapsedRealtime() - startedAtMs >= deadlineElapsedMs) {
+            if (activeElapsedMs(startedAtNanos) >= deadlineElapsedMs) {
                 timedOut = true;
                 return true;
             }
@@ -355,7 +474,7 @@ final class LiveCombatFlowWaiter {
 
         @Override
         public String stopReason() {
-            return cancelled ? "scan cancelled" : "scan timed out";
+            return control.cancelled() ? "scan cancelled" : "scan timed out";
         }
 
         boolean timedOut() {
@@ -368,6 +487,7 @@ final class LiveCombatFlowWaiter {
         final boolean matched;
         final boolean cancelled;
         final boolean timedOut;
+        final boolean failed;
         final int attempts;
         final long elapsedMs;
         final String detail;
@@ -377,6 +497,7 @@ final class LiveCombatFlowWaiter {
                 boolean matched,
                 boolean cancelled,
                 boolean timedOut,
+                boolean failed,
                 int attempts,
                 long elapsedMs,
                 String detail
@@ -385,25 +506,30 @@ final class LiveCombatFlowWaiter {
             this.matched = matched;
             this.cancelled = cancelled;
             this.timedOut = timedOut;
+            this.failed = failed;
             this.attempts = attempts;
             this.elapsedMs = elapsedMs;
             this.detail = detail;
         }
 
         static Update progress(int attempts, long elapsedMs, String detail) {
-            return new Update(true, false, false, false, attempts, elapsedMs, detail);
+            return new Update(true, false, false, false, false, attempts, elapsedMs, detail);
         }
 
         static Update matched(int attempts, long elapsedMs, String detail) {
-            return new Update(false, true, false, false, attempts, elapsedMs, detail);
+            return new Update(false, true, false, false, false, attempts, elapsedMs, detail);
         }
 
         static Update cancelled(int attempts, long elapsedMs, String detail) {
-            return new Update(false, false, true, false, attempts, elapsedMs, detail);
+            return new Update(false, false, true, false, false, attempts, elapsedMs, detail);
         }
 
         static Update timedOut(int attempts, long elapsedMs, String detail) {
-            return new Update(false, false, false, true, attempts, elapsedMs, detail);
+            return new Update(false, false, false, true, false, attempts, elapsedMs, detail);
+        }
+
+        static Update failed(int attempts, long elapsedMs, String detail) {
+            return new Update(false, false, false, false, true, attempts, elapsedMs, detail);
         }
 
         String toStatusLine() {
@@ -419,7 +545,7 @@ final class LiveCombatFlowWaiter {
             if (timedOut) {
                 return "Live combat wait: timed out after " + elapsedMs + "ms";
             }
-            return "Live combat wait: failed";
+            return failed ? "Live combat wait: failed" : "Live combat wait: invalid terminal";
         }
     }
 }

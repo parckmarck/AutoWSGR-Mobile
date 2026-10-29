@@ -240,11 +240,16 @@ final class EnemyCompositionRecognizer {
             return new ProbeResult(ok, detail.toString());
         }
 
+        Bitmap gameFrame = null;
         try {
-            Detection live = detectFight(liveFrame);
+            gameFrame = GameFrameNormalizer.toLandscapeGameFrame(liveFrame);
+            Detection live = detectFight(gameFrame);
             append(detail, "live fight=" + live.detailLine());
             return new ProbeResult(ok, detail.toString());
         } finally {
+            if (gameFrame != null) {
+                gameFrame.recycle();
+            }
             liveFrame.recycle();
         }
     }

@@ -2,21 +2,23 @@ package org.openwsgr.autowsgrmobile;
 
 import android.content.Context;
 import android.graphics.Bitmap;
-import android.os.Handler;
-import android.os.Looper;
-import android.os.SystemClock;
 
 import org.openwsgr.autowsgrmobile.vision.TemplateMatcher;
+
+import java.util.concurrent.TimeUnit;
 
 final class GuardedCombatRunner {
     private static final long PHASE_SCAN_TIMEOUT_MS = 3500L;
     private static final int PHASE_SCAN_STRIDE = 24;
     private static final double PHASE_SCAN_THRESHOLD = 0.999;
     private static final int DEFAULT_LOOP_MAX_STEPS = 5;
+    private static final long CHILD_TERMINAL_TIMEOUT_MS = 15000L;
+    private static final long CHILD_TERMINAL_POLL_MS = 250L;
 
     private final Context appContext;
-    private final Handler mainHandler;
-    private final Callback callback;
+    private final AutomationControl control;
+    private final AutomationSession session;
+    private final OneShotStartGate startGate = new OneShotStartGate();
     private final int maxSteps;
     private final CombatPlanPolicy planPolicy;
     private final MapNodeData mapNodeData;
@@ -26,18 +28,19 @@ final class GuardedCombatRunner {
 
     private Thread worker;
     private GuardedCombatStepper activeStepper;
-    private volatile boolean cancelled;
     private boolean running;
 
     private GuardedCombatRunner(
             Context context,
             int maxSteps,
             CombatPlanPolicy selectedPolicy,
-            Callback callback
+            AutomationCallback callback
     ) {
         this.appContext = context.getApplicationContext();
-        this.mainHandler = new Handler(Looper.getMainLooper());
-        this.callback = callback;
+        String runId = String.valueOf(System.currentTimeMillis());
+        this.control = new AutomationControl();
+        this.session = new AutomationSession("guarded", runId, control,
+                AndroidAutomationSessionSink.create(appContext, "guarded-combat", runId), callback);
         this.maxSteps = Math.max(1, maxSteps);
         this.planPolicy = selectedPolicy == null ? loadDefaultPolicy() : selectedPolicy;
         this.mapNodeData = loadMapNodeData();
@@ -46,18 +49,18 @@ final class GuardedCombatRunner {
         this.runnerPlan = buildRunnerPlan();
     }
 
-    static GuardedCombatRunner oneStepExecuteGuarded(Context context, Callback callback) {
+    static GuardedCombatRunner oneStepExecuteGuarded(Context context, AutomationCallback callback) {
         return new GuardedCombatRunner(context, 1, null, callback);
     }
 
-    static GuardedCombatRunner boundedLoopExecuteGuarded(Context context, Callback callback) {
+    static GuardedCombatRunner boundedLoopExecuteGuarded(Context context, AutomationCallback callback) {
         return new GuardedCombatRunner(context, DEFAULT_LOOP_MAX_STEPS, null, callback);
     }
 
     static GuardedCombatRunner boundedLoopExecuteGuarded(
             Context context,
             CombatPlanPolicy selectedPolicy,
-            Callback callback
+            AutomationCallback callback
     ) {
         return new GuardedCombatRunner(context, DEFAULT_LOOP_MAX_STEPS, selectedPolicy, callback);
     }
@@ -135,16 +138,31 @@ final class GuardedCombatRunner {
     }
 
     synchronized boolean start() {
-        if (running) {
+        OneShotStartGate.Decision decision = startGate.claim(session.cancelled());
+        if (decision == OneShotStartGate.Decision.REJECTED) {
             return false;
         }
-        cancelled = false;
+        if (decision == OneShotStartGate.Decision.PRE_CANCELLED) {
+            finish(AutomationOutcome.CANCELLED, "Guarded runner: cancelled",
+                    runnerPlan + "\npreStart=cancelled", false);
+            return true;
+        }
         running = true;
-        post(Update.running("Guarded runner: starting", runnerPlan + "\nphaseScan=queued"));
+        progress("Guarded runner: starting", runnerPlan + "\nphaseScan=queued");
         worker = new Thread(new Runnable() {
             @Override
             public void run() {
-                runLoop();
+                try {
+                    runLoop();
+                } catch (Throwable failure) {
+                    if (session.cancelled()) {
+                        finish(AutomationOutcome.CANCELLED, "Guarded runner: cancelled",
+                                runnerPlan + "\nreason=" + failure, false);
+                    } else {
+                        finish(AutomationOutcome.FAILED, "Guarded runner: failed",
+                                runnerPlan + "\nreason=" + failure, true);
+                    }
+                }
             }
         }, "AutoWSGR-guarded-runner");
         worker.setPriority(Thread.MIN_PRIORITY);
@@ -153,7 +171,7 @@ final class GuardedCombatRunner {
     }
 
     synchronized void cancel() {
-        cancelled = true;
+        session.cancel();
         if (activeStepper != null) {
             activeStepper.cancel();
         }
@@ -161,6 +179,14 @@ final class GuardedCombatRunner {
         if (active != null) {
             active.interrupt();
         }
+    }
+
+    synchronized void pause() {
+        session.pause();
+    }
+
+    synchronized void resume() {
+        session.resume();
     }
 
     synchronized boolean isRunning() {
@@ -171,23 +197,28 @@ final class GuardedCombatRunner {
         int completedSteps = 0;
         int routeIndex = 0;
         int pendingRuleFormation = 0;
-        while (!cancelled && completedSteps < maxSteps) {
+        while (!session.cancelled() && completedSteps < maxSteps) {
+            if (!session.checkpoint()) {
+                finish(AutomationOutcome.CANCELLED, "Guarded runner: cancelled",
+                        runnerPlan + "\nstepsCompleted=" + completedSteps, false);
+                return;
+            }
             int stepIndex = completedSteps + 1;
             RouteSync routeSync = updateRouteCursorFromLiveNode(routeIndex);
             routeIndex = routeSync.routeIndex;
             String routeDetail = routeSummary(routeIndex);
             if (routeSync.blocked) {
-                finish(
+                finish(AutomationOutcome.BLOCKED,
                         "Guarded runner: route node out of plan",
                         runnerPlan
                                 + "\n" + routeSync.detail
                                 + "\n" + routeDetail
                                 + "\nstepsCompleted=" + completedSteps
                                 + "\nphaseScan=skipped by route guard"
-                );
+                , true);
                 return;
             }
-            post(Update.running(
+            progress(
                     "Guarded runner: scanning step " + stepIndex + "/" + maxSteps,
                     runnerPlan
                             + "\n" + routeSync.detail
@@ -195,22 +226,36 @@ final class GuardedCombatRunner {
                             + "\nstepsCompleted=" + completedSteps
                             + "\nphaseScan=candidates "
                             + NativeCombatTransitions.format(GuardedCombatStepper.guardedPhases())
-            ));
+            );
 
             NativeCombatRecognizer.Recognition recognition = recognizeGuardablePhase();
-            if (cancelled) {
-                finish("Guarded runner: cancelled", runnerPlan + "\nstepsCompleted=" + completedSteps + "\nphaseScan=cancelled");
+            if (!session.checkpoint()) {
+                finish(AutomationOutcome.CANCELLED, "Guarded runner: cancelled", runnerPlan + "\nstepsCompleted=" + completedSteps + "\nphaseScan=cancelled", false);
                 return;
             }
             if (!recognition.matched) {
-                finish(
+                finish(AutomationOutcome.BLOCKED,
                         "Guarded runner: no guarded phase",
                         runnerPlan
                                 + "\n" + routeSync.detail
                                 + "\n" + routeDetail
                                 + "\nstepsCompleted=" + completedSteps
                                 + "\nphaseScan=" + GuardedCombatStepper.formatRecognition(recognition)
-                );
+                , true);
+                return;
+            }
+
+            AutomationOutcome explicitTerminal = terminalOutcomeBeforeGesture(recognition.phase);
+            if (explicitTerminal != null) {
+                finish(explicitTerminal,
+                        "Guarded runner: dock full",
+                        runnerPlan
+                                + "\n" + routeSync.detail
+                                + "\n" + routeDetail
+                                + "\nstepsCompleted=" + completedSteps
+                                + "\nphaseScan=" + GuardedCombatStepper.formatRecognition(recognition)
+                                + "\ngesture=not dispatched",
+                        true);
                 return;
             }
 
@@ -229,13 +274,15 @@ final class GuardedCombatRunner {
                     + "\n" + enemyScan.detail
                     + "\n" + planDecision.detail();
             StepResult stepResult = new StepResult();
+            AutomationControl childControl = control.childControl();
             GuardedCombatStepper stepper = GuardedCombatStepper.executeGuardedForActionId(
                     appContext,
                     actionId,
+                    childControl,
                     stepperCallback(stepIndex, recognition, actionId, routeDetail, planDecisionDetail, stepResult)
             );
             if (stepper == null) {
-                finish(
+                finish(AutomationOutcome.BLOCKED,
                         "Guarded runner: no action spec",
                         runnerPlan
                                 + "\n" + routeDetail
@@ -243,18 +290,22 @@ final class GuardedCombatRunner {
                                 + "\nphaseScan=" + GuardedCombatStepper.formatRecognition(recognition)
                                 + "\n" + planDecisionDetail
                                 + "\nselectedAction=none"
-                );
+                , true);
                 return;
             }
-
-            synchronized (this) {
-                if (cancelled) {
-                    running = false;
-                    post(Update.finished("Guarded runner: cancelled", runnerPlan + "\n" + routeDetail + "\nstepsCompleted=" + completedSteps + "\nphaseScan=cancelled"));
-                    return;
+            final ChildState childState = new ChildState() {
+                @Override public boolean start() {
+                    return stepper.start();
                 }
-                activeStepper = stepper;
-            }
+
+                @Override public boolean isRunning() {
+                    return stepper.isRunning();
+                }
+
+                @Override public void cancel() {
+                    stepper.cancel();
+                }
+            };
 
             String selectedDetail = runnerPlan
                     + "\n" + routeDetail
@@ -263,18 +314,47 @@ final class GuardedCombatRunner {
                     + "\nphaseScan=" + GuardedCombatStepper.formatRecognition(recognition)
                     + "\n" + planDecisionDetail
                     + "\nselectedAction=" + actionId;
-            post(Update.running("Guarded runner: selected " + actionId, selectedDetail));
-            if (!stepper.start()) {
-                finish("Guarded runner: stepper already running", selectedDetail);
+            progress("Guarded runner: selected " + actionId, selectedDetail);
+            boolean publicationReady = false;
+            boolean childStarted = false;
+            while (!publicationReady) {
+                if (!session.checkpoint()) {
+                    finish(AutomationOutcome.CANCELLED, "Guarded runner: cancelled",
+                            selectedDetail + "\ncheckpoint=cancelled before stepper", false);
+                    return;
+                }
+                synchronized (this) {
+                    if (session.cancelled()) {
+                        finish(AutomationOutcome.CANCELLED, "Guarded runner: cancelled",
+                                selectedDetail + "\ncheckpoint=cancelled before child publication", false);
+                        return;
+                    }
+                    if (!session.paused()) {
+                        activeStepper = stepper;
+                        childStarted = startChildIfAllowed(session, childState);
+                        if (!childStarted) {
+                            activeStepper = null;
+                        }
+                        publicationReady = true;
+                    }
+                }
+            }
+            if (!childStarted) {
+                finish(AutomationOutcome.BLOCKED, "Guarded runner: stepper already running", selectedDetail, true);
                 return;
             }
 
-            GuardedCombatStepper.Update finalUpdate = stepResult.await();
+            GuardedCombatStepper.Update finalUpdate = stepResult.await(
+                    session,
+                    childState,
+                    CHILD_TERMINAL_TIMEOUT_MS,
+                    CHILD_TERMINAL_POLL_MS
+            );
             synchronized (this) {
                 activeStepper = null;
             }
-            if (finalUpdate == null || cancelled) {
-                finish("Guarded runner: cancelled", selectedDetail + "\nstepperStatus=cancelled or interrupted");
+            if (finalUpdate == null || session.cancelled()) {
+                finish(AutomationOutcome.CANCELLED, "Guarded runner: cancelled", selectedDetail + "\nstepperStatus=cancelled or interrupted", false);
                 return;
             }
 
@@ -282,7 +362,9 @@ final class GuardedCombatRunner {
                     + "\nstepperStatus=" + finalUpdate.status
                     + "\n" + finalUpdate.detail;
             if (!stepCompleted(finalUpdate)) {
-                finish(finalStatus(finalUpdate.status, actionId), finalDetail);
+                finish(stepAutomationOutcome(finalUpdate.outcome),
+                        finalStatus(finalUpdate.outcome, actionId), finalDetail,
+                        finalUpdate.outcome == GuardedCombatStepper.StepOutcome.FAILED);
                 return;
             }
 
@@ -300,24 +382,26 @@ final class GuardedCombatRunner {
                 finalDetail += "\nrouteAdvance=next node, " + routeSummary(routeIndex);
             }
             if (planDecision.routeEnds) {
-                finish("Guarded runner: route complete", finalDetail + "\nstepsCompleted=" + completedSteps);
+                finish(AutomationOutcome.SUCCESS, "Guarded runner: route complete", finalDetail + "\nstepsCompleted=" + completedSteps, false);
                 return;
             }
             if (completedSteps >= maxSteps) {
-                finish("Guarded runner: max steps reached", finalDetail + "\nstepsCompleted=" + completedSteps);
+                finish(AutomationOutcome.EXHAUSTED, "Guarded runner: max steps reached", finalDetail + "\nstepsCompleted=" + completedSteps, false);
                 return;
             }
 
-            post(Update.running(
+            progress(
                     "Guarded runner: step complete " + completedSteps + "/" + maxSteps,
                     finalDetail + "\nnext=scan next guarded phase"
-            ));
+            );
         }
 
-        finish(
-                cancelled ? "Guarded runner: cancelled" : "Guarded runner: max steps reached",
-                runnerPlan + "\n" + routeSummary(routeIndex) + "\nstepsCompleted=" + completedSteps
-        );
+        AutomationOutcome outcome = session.cancelled()
+                ? AutomationOutcome.CANCELLED : AutomationOutcome.EXHAUSTED;
+        finish(outcome,
+                session.cancelled() ? "Guarded runner: cancelled" : "Guarded runner: max steps reached",
+                runnerPlan + "\n" + routeSummary(routeIndex) + "\nstepsCompleted=" + completedSteps,
+                false);
     }
 
     private NativeCombatRecognizer.Recognition recognizeGuardablePhase() {
@@ -363,9 +447,9 @@ final class GuardedCombatRunner {
                         + "\nselectedAction=" + actionId
                         + "\nstepperStatus=" + update.status
                         + "\n" + update.detail;
-                if (update.running) {
-                    if (!cancelled) {
-                        post(Update.running("Guarded runner: step running " + stepIndex + "/" + maxSteps + " " + actionId, detail));
+                if (update.running()) {
+                    if (!session.cancelled()) {
+                        progress("Guarded runner: step running " + stepIndex + "/" + maxSteps + " " + actionId, detail);
                     }
                     return;
                 }
@@ -374,10 +458,15 @@ final class GuardedCombatRunner {
         };
     }
 
-    private synchronized void finish(String status, String detail) {
+    private synchronized void finish(AutomationOutcome outcome, String status, String detail,
+                                     boolean saveFailure) {
         running = false;
         activeStepper = null;
-        post(Update.finished(status, detail));
+        session.finish(outcome, status, detail, saveFailure);
+    }
+
+    private void progress(String status, String detail) {
+        session.progress(status, detail);
     }
 
     private String buildRunnerPlan() {
@@ -452,8 +541,10 @@ final class GuardedCombatRunner {
         if (liveFrame == null) {
             return new RouteSync(currentRouteIndex, "routeNodeScan=unavailable missing MediaProjection frame");
         }
+        Bitmap gameFrame = null;
         try {
-            RouteNodeTracker.RouteUpdate update = routeNodeTracker.updateFromFrame(liveFrame);
+            gameFrame = GameFrameNormalizer.toLandscapeGameFrame(liveFrame);
+            RouteNodeTracker.RouteUpdate update = routeNodeTracker.updateFromFrame(gameFrame);
             if (update.acceptedPosition && !planPolicy.isRouteNodeAllowed(update.currentNode)) {
                 return new RouteSync(
                         currentRouteIndex,
@@ -476,6 +567,9 @@ final class GuardedCombatRunner {
                             + ", trackerNode=" + update.currentNode
             );
         } finally {
+            if (gameFrame != null) {
+                gameFrame.recycle();
+            }
             liveFrame.recycle();
         }
     }
@@ -522,9 +616,11 @@ final class GuardedCombatRunner {
         if (liveFrame == null) {
             return new EnemyScan(null, null, "enemyScan=spot unavailable: missing MediaProjection frame");
         }
+        Bitmap gameFrame = null;
         try {
-            EnemyCompositionRecognizer.Detection detection = EnemyCompositionRecognizer.detectFight(liveFrame);
-            EnemyFormationRecognizer.Detection formation = EnemyFormationRecognizer.detectFight(liveFrame);
+            gameFrame = GameFrameNormalizer.toLandscapeGameFrame(liveFrame);
+            EnemyCompositionRecognizer.Detection detection = EnemyCompositionRecognizer.detectFight(gameFrame);
+            EnemyFormationRecognizer.Detection formation = EnemyFormationRecognizer.detectFight(gameFrame);
             String action = detection.reliable || formation.reliable
                     ? "accepted for spot rules"
                     : "ignored, default spot_fight";
@@ -536,6 +632,9 @@ final class GuardedCombatRunner {
                             + ", action=" + action
             );
         } finally {
+            if (gameFrame != null) {
+                gameFrame.recycle();
+            }
             liveFrame.recycle();
         }
     }
@@ -550,9 +649,11 @@ final class GuardedCombatRunner {
             return "damageScan=result unavailable: missing MediaProjection frame, current="
                     + damageSnapshot.shortLabel();
         }
+        Bitmap gameFrame = null;
         try {
+            gameFrame = GameFrameNormalizer.toLandscapeGameFrame(liveFrame);
             ShipDamageRecognizer.Detection detection = ShipDamageRecognizer.detectResult(
-                    liveFrame,
+                    gameFrame,
                     damageSnapshot
             );
             if (detection.reliable) {
@@ -562,37 +663,74 @@ final class GuardedCombatRunner {
                     + ", accepted=" + detection.reliable
                     + ", current=" + damageSnapshot.shortLabel();
         } finally {
+            if (gameFrame != null) {
+                gameFrame.recycle();
+            }
             liveFrame.recycle();
         }
     }
 
-    private boolean stepCompleted(GuardedCombatStepper.Update update) {
-        return update.status.contains("wait matched");
+    static boolean stepCompleted(GuardedCombatStepper.Update update) {
+        if (update == null) {
+            return false;
+        }
+        switch (update.outcome) {
+            case MATCHED:
+                return true;
+            case RUNNING:
+            case BLOCKED:
+            case TIMED_OUT:
+            case CANCELLED:
+            case FAILED:
+            default:
+                return false;
+        }
     }
 
-    private String finalStatus(String stepperStatus, String actionId) {
-        if (stepperStatus.contains("cancelled")) {
-            return "Guarded runner: cancelled";
-        }
-        if (stepperStatus.contains("blocked")) {
-            return "Guarded runner: step blocked " + actionId;
-        }
-        if (stepperStatus.contains("timed out")) {
-            return "Guarded runner: wait timed out " + actionId;
-        }
-        if (stepperStatus.contains("wait matched")) {
-            return "Guarded runner: step complete " + actionId;
-        }
-        return "Guarded runner: step finished " + actionId;
+    static AutomationOutcome terminalOutcomeBeforeGesture(NativeCombatPhase phase) {
+        return phase == NativeCombatPhase.DOCK_FULL ? AutomationOutcome.DOCK_FULL : null;
     }
 
-    private void post(final Update update) {
-        mainHandler.post(new Runnable() {
-            @Override
-            public void run() {
-                callback.onUpdate(update);
-            }
-        });
+    static boolean startChildIfAllowed(AutomationSession session, ChildState child) {
+        return session != null
+                && child != null
+                && !session.cancelled()
+                && !session.paused()
+                && child.start();
+    }
+
+    private static String finalStatus(GuardedCombatStepper.StepOutcome outcome, String actionId) {
+        switch (outcome) {
+            case CANCELLED:
+                return "Guarded runner: cancelled";
+            case BLOCKED:
+                return "Guarded runner: step blocked " + actionId;
+            case TIMED_OUT:
+                return "Guarded runner: wait timed out " + actionId;
+            case MATCHED:
+                return "Guarded runner: step complete " + actionId;
+            case FAILED:
+                return "Guarded runner: step failed " + actionId;
+            case RUNNING:
+            default:
+                return "Guarded runner: step finished " + actionId;
+        }
+    }
+
+    private static AutomationOutcome stepAutomationOutcome(GuardedCombatStepper.StepOutcome outcome) {
+        switch (outcome) {
+            case CANCELLED:
+                return AutomationOutcome.CANCELLED;
+            case FAILED:
+                return AutomationOutcome.FAILED;
+            case MATCHED:
+                return AutomationOutcome.SUCCESS;
+            case BLOCKED:
+            case TIMED_OUT:
+            case RUNNING:
+            default:
+                return AutomationOutcome.BLOCKED;
+        }
     }
 
     private static void append(StringBuilder builder, String line) {
@@ -603,40 +741,21 @@ final class GuardedCombatRunner {
     }
 
     private final class PhaseScanDeadline implements TemplateMatcher.ScanControl {
-        private final long startedAtMs = SystemClock.elapsedRealtime();
+        private final long startedAtNanos = session.activeTimeNanos();
 
         @Override
         public boolean shouldStop() {
-            return cancelled || SystemClock.elapsedRealtime() - startedAtMs >= PHASE_SCAN_TIMEOUT_MS;
+            if (!session.checkpoint()) {
+                return true;
+            }
+            return TimeUnit.NANOSECONDS.toMillis(
+                    session.activeTimeNanos() - startedAtNanos
+            ) >= PHASE_SCAN_TIMEOUT_MS;
         }
 
         @Override
         public String stopReason() {
-            return cancelled ? "phase scan cancelled" : "phase scan timed out";
-        }
-    }
-
-    interface Callback {
-        void onUpdate(Update update);
-    }
-
-    static final class Update {
-        final boolean running;
-        final String status;
-        final String detail;
-
-        private Update(boolean running, String status, String detail) {
-            this.running = running;
-            this.status = status;
-            this.detail = detail;
-        }
-
-        static Update running(String status, String detail) {
-            return new Update(true, status, detail);
-        }
-
-        static Update finished(String status, String detail) {
-            return new Update(false, status, detail);
+            return session.cancelled() ? "phase scan cancelled" : "phase scan timed out";
         }
     }
 
@@ -650,24 +769,84 @@ final class GuardedCombatRunner {
         }
     }
 
-    private static final class StepResult {
-        private GuardedCombatStepper.Update update;
+    interface ChildState {
+        boolean start();
+        boolean isRunning();
+        void cancel();
+    }
 
-        synchronized GuardedCombatStepper.Update await() {
-            while (update == null) {
-                try {
-                    wait();
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
+    static final class StepResult {
+        private volatile GuardedCombatStepper.Update update;
+
+        GuardedCombatStepper.Update await(AutomationSession session, ChildState child,
+                                          long timeoutMs, long pollMs) {
+            long safeTimeoutMs = Math.max(1L, timeoutMs);
+            long safePollMs = Math.max(1L, pollMs);
+            long startedAtNanos = session.activeTimeNanos();
+            long stoppedAtNanos = -1L;
+            while (!session.cancelled()) {
+                if (!session.checkpoint()) {
                     return null;
+                }
+                synchronized (this) {
+                    if (update != null) {
+                        return update;
+                    }
+                }
+
+                long activeNowNanos = session.activeTimeNanos();
+                long elapsedMs = elapsedMs(activeNowNanos - startedAtNanos);
+                if (elapsedMs >= safeTimeoutMs) {
+                    child.cancel();
+                    return GuardedCombatStepper.Update.terminal(
+                            GuardedCombatStepper.StepOutcome.FAILED,
+                            "Guarded runner: child terminal timeout",
+                            "childRunning=" + child.isRunning() + ", timeoutMs=" + safeTimeoutMs
+                    );
+                }
+
+                if (!child.isRunning()) {
+                    if (stoppedAtNanos < 0L) {
+                        stoppedAtNanos = activeNowNanos;
+                    } else {
+                        long stoppedMs = elapsedMs(activeNowNanos - stoppedAtNanos);
+                        long graceMs = Math.max(50L, safePollMs * 2L);
+                        if (stoppedMs >= graceMs) {
+                            return GuardedCombatStepper.Update.terminal(
+                                    GuardedCombatStepper.StepOutcome.FAILED,
+                                    "Guarded runner: child stopped without terminal",
+                                    "childRunning=false, terminalMissing=true, graceMs=" + graceMs
+                            );
+                        }
+                    }
+                } else {
+                    stoppedAtNanos = -1L;
+                }
+
+                synchronized (this) {
+                    if (update != null) {
+                        return update;
+                    }
+                    try {
+                        wait(Math.min(safePollMs, Math.max(1L, safeTimeoutMs - elapsedMs)));
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        return null;
+                    }
                 }
             }
             return update;
         }
 
+        private static long elapsedMs(long elapsedNanos) {
+            return TimeUnit.NANOSECONDS.toMillis(elapsedNanos);
+        }
+
         synchronized void finish(GuardedCombatStepper.Update update) {
-            this.update = update;
-            notifyAll();
+            if (this.update == null) {
+                this.update = update;
+                notifyAll();
+            }
         }
     }
 

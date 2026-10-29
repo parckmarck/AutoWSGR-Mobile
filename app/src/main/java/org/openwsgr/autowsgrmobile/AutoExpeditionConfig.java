@@ -23,14 +23,13 @@ final class AutoExpeditionConfig {
                 continue;
             }
             String key = line.substring(0, colon).trim();
-            String value = line.substring(colon + 1).trim();
+            String value = cleanScalar(line.substring(colon + 1).trim());
             if ("interval_seconds".equals(key)) {
-                String cleanValue = cleanScalar(value);
                 try {
-                    intervalSeconds = Long.parseLong(cleanValue);
+                    intervalSeconds = Long.parseLong(value);
                 } catch (NumberFormatException e) {
                     throw new IllegalArgumentException(
-                            "invalid interval_seconds: " + cleanValue,
+                            "invalid interval_seconds: " + value,
                             e
                     );
                 }

@@ -11,13 +11,30 @@ final class GameFrameNormalizer {
 
     static Bitmap toLandscapeGameFrame(Bitmap source) {
         GameFrameViewport viewport = GameFrameViewport.fromFrame(source.getWidth(), source.getHeight());
+        // Bitmap.createBitmap may return `source` itself when the crop covers the whole frame
+        // (e.g. an exact 16:9 capture). Track aliasing so we never recycle or hand back the
+        // caller-owned source bitmap, which would otherwise lead to a double recycle.
         Bitmap cropped = Bitmap.createBitmap(source, viewport.left, viewport.top, viewport.width, viewport.height);
+        boolean croppedIsOwned = cropped != source;
         if (cropped.getWidth() == NORMALIZED_WIDTH && cropped.getHeight() == NORMALIZED_HEIGHT) {
-            return cropped;
+            if (croppedIsOwned) {
+                return cropped;
+            }
+            return copyOf(source);
         }
         Bitmap scaled = Bitmap.createScaledBitmap(cropped, NORMALIZED_WIDTH, NORMALIZED_HEIGHT, true);
-        cropped.recycle();
+        if (croppedIsOwned && scaled != cropped) {
+            cropped.recycle();
+        }
         return scaled;
+    }
+
+    private static Bitmap copyOf(Bitmap source) {
+        Bitmap.Config config = source.getConfig();
+        if (config == null) {
+            config = Bitmap.Config.ARGB_8888;
+        }
+        return source.copy(config, false);
     }
 
     static Bitmap toPhaseScanFrame(Bitmap source) {

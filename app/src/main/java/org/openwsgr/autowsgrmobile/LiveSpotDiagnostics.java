@@ -22,15 +22,20 @@ final class LiveSpotDiagnostics {
             );
         }
 
+        Bitmap gameFrame = null;
         try {
+            gameFrame = GameFrameNormalizer.toLandscapeGameFrame(frame);
             return analyzeFrame(
                     "live spot diagnostics",
                     "Live spot diagnostics: ready",
                     "Live spot diagnostics: sampled",
-                    frame,
+                    gameFrame,
                     snapshot
             );
         } finally {
+            if (gameFrame != null) {
+                gameFrame.recycle();
+            }
             frame.recycle();
         }
     }

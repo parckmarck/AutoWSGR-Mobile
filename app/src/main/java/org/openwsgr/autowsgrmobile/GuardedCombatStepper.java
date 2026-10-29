@@ -191,7 +191,8 @@ final class GuardedCombatStepper {
             NativeCombatPhase.MISSILE_ANIMATION,
             NativeCombatPhase.NIGHT_PROMPT,
             NativeCombatPhase.RESULT,
-            NativeCombatPhase.GET_SHIP
+            NativeCombatPhase.GET_SHIP,
+            NativeCombatPhase.DOCK_FULL
     };
 
     private final Context appContext;
@@ -201,16 +202,18 @@ final class GuardedCombatStepper {
     private final boolean executeGesture;
     private final ActionSpec spec;
     private final String planDetail;
-    private LiveCombatFlowWaiter waiter;
+    private final AutomationControl control;
+    private final OneShotStartGate startGate = new OneShotStartGate();
+    private final WaiterLifecycle waiterLifecycle = new WaiterLifecycle();
+    private final PublicationGate publicationGate = new PublicationGate();
     private Thread worker;
-    private volatile boolean cancelled;
-    private boolean running;
 
     private GuardedCombatStepper(
             Context context,
             ActionSpec spec,
             boolean dryRun,
             boolean executeGesture,
+            AutomationControl control,
             Callback callback
     ) {
         this.appContext = context.getApplicationContext();
@@ -219,6 +222,7 @@ final class GuardedCombatStepper {
         this.spec = spec;
         this.dryRun = dryRun;
         this.executeGesture = executeGesture;
+        this.control = control;
         this.planDetail = buildPlan();
     }
 
@@ -311,11 +315,20 @@ final class GuardedCombatStepper {
             String actionId,
             Callback callback
     ) {
+        return executeGuardedForActionId(context, actionId, new AutomationControl(), callback);
+    }
+
+    static GuardedCombatStepper executeGuardedForActionId(
+            Context context,
+            String actionId,
+            AutomationControl control,
+            Callback callback
+    ) {
         ActionSpec spec = specForActionId(actionId);
         if (spec == null) {
             return null;
         }
-        return executeGuarded(context, spec, callback);
+        return executeGuarded(context, spec, control, callback);
     }
 
     static NativeCombatPhase[] guardedPhases() {
@@ -443,7 +456,9 @@ final class GuardedCombatStepper {
             ActionSpec spec,
             Callback callback
     ) {
-        return new GuardedCombatStepper(context, spec, true, false, callback);
+        return new GuardedCombatStepper(
+                context, spec, true, false, new AutomationControl(), callback
+        );
     }
 
     private static GuardedCombatStepper executeGuarded(
@@ -451,46 +466,101 @@ final class GuardedCombatStepper {
             ActionSpec spec,
             Callback callback
     ) {
-        return new GuardedCombatStepper(context, spec, false, true, callback);
+        return executeGuarded(context, spec, new AutomationControl(), callback);
     }
 
-    synchronized boolean start() {
-        if (running) {
+    private static GuardedCombatStepper executeGuarded(
+            Context context,
+            ActionSpec spec,
+            AutomationControl control,
+            Callback callback
+    ) {
+        return new GuardedCombatStepper(context, spec, false, true, control, callback);
+    }
+
+    boolean start() {
+        OneShotStartGate.Decision decision = startGate.claim(control.cancelled());
+        if (decision == OneShotStartGate.Decision.REJECTED) {
             return false;
         }
-        cancelled = false;
-        running = true;
-        post(Update.running("Guarded stepper: starting " + spec.id, planDetail + "\n" + preflightDetail()));
+        if (decision == OneShotStartGate.Decision.START && !waiterLifecycle.begin()) {
+            decision = OneShotStartGate.Decision.PRE_CANCELLED;
+        }
+        if (decision == OneShotStartGate.Decision.PRE_CANCELLED) {
+            finish(
+                    StepOutcome.CANCELLED,
+                    "Guarded stepper: cancelled",
+                    planDetail + "\npreStart=cancelled; gesture=not dispatched"
+            );
+            return true;
+        }
+        postRunning(Update.running(
+                "Guarded stepper: starting " + spec.id,
+                planDetail + "\n" + preflightDetail()
+        ));
 
         if (dryRun) {
             startWaiter();
             return true;
         }
 
-        worker = new Thread(new Runnable() {
+        Thread createdWorker = new Thread(new Runnable() {
             @Override
             public void run() {
-                runGuardAndMaybeExecute();
+                try {
+                    runGuardAndMaybeExecute();
+                } catch (Throwable failure) {
+                    if (control.cancelled()) {
+                        finish(StepOutcome.CANCELLED, "Guarded stepper: cancelled",
+                                planDetail + "\nuncaught-exception-after-cancel=" + failure);
+                    } else {
+                        finish(StepOutcome.FAILED, "Guarded stepper: failed " + spec.id,
+                                planDetail + "\nuncaught-exception=" + failure);
+                    }
+                }
             }
         }, "AutoWSGR-guarded-stepper");
-        worker.setPriority(Thread.MIN_PRIORITY);
-        worker.start();
+        createdWorker.setPriority(Thread.MIN_PRIORITY);
+        synchronized (this) {
+            worker = createdWorker;
+        }
+        createdWorker.start();
         return true;
     }
 
-    synchronized void cancel() {
-        cancelled = true;
-        if (waiter != null) {
-            waiter.cancel();
+    void cancel() {
+        final WaiterHandle[] waiterToCancel = new WaiterHandle[1];
+        publicationGate.cancelWith(new Runnable() {
+            @Override public void run() {
+                waiterToCancel[0] = waiterLifecycle.claimCancellationWith(new Runnable() {
+                    @Override public void run() {
+                        control.cancel();
+                    }
+                });
+            }
+        });
+        if (waiterToCancel[0] != null) {
+            waiterToCancel[0].cancel();
         }
-        Thread active = worker;
+        Thread active;
+        synchronized (this) {
+            active = worker;
+        }
         if (active != null) {
             active.interrupt();
         }
     }
 
-    synchronized boolean isRunning() {
-        return running;
+    synchronized void pause() {
+        control.pause();
+    }
+
+    synchronized void resume() {
+        control.resume();
+    }
+
+    boolean isRunning() {
+        return waiterLifecycle.isRunning();
     }
 
     private void runGuardAndMaybeExecute() {
@@ -500,19 +570,20 @@ final class GuardedCombatStepper {
         }
 
         if (spec.requiresFreshPhaseGuard()) {
-            post(Update.running(
+            postRunning(Update.running(
                     "Guarded stepper: phase guard " + spec.id,
                     planDetail + "\n" + preflightDetail()
                             + "\nphaseGuard=checking expected=" + spec.guardPhase.id
             ));
 
             NativeCombatRecognizer.Recognition recognition = recognizeGuardPhase();
-            if (cancelled) {
-                finish("Guarded stepper: cancelled", planDetail + "\nphaseGuard=cancelled");
+            if (!checkpoint()) {
+                finish(StepOutcome.CANCELLED, "Guarded stepper: cancelled", planDetail + "\nphaseGuard=cancelled");
                 return;
             }
             if (!recognition.matched) {
                 finish(
+                        StepOutcome.BLOCKED,
                         "Guarded stepper: blocked by phase guard",
                         planDetail + "\nphaseGuard=blocked expected=" + spec.guardPhase.id
                                 + ", latest=" + formatRecognition(recognition)
@@ -520,12 +591,12 @@ final class GuardedCombatStepper {
                 return;
             }
 
-            post(Update.running(
+            postRunning(Update.running(
                     "Guarded stepper: phase guard passed " + spec.id,
                     planDetail + "\nphaseGuard=passed, latest=" + formatRecognition(recognition)
             ));
         } else {
-            post(Update.running(
+            postRunning(Update.running(
                     "Guarded stepper: phase guard skipped " + spec.id,
                     planDetail + "\n" + preflightDetail()
                             + "\nphaseGuard=skipped, source=runner phase scan"
@@ -535,6 +606,7 @@ final class GuardedCombatStepper {
         GestureDispatch dispatch = dispatchGesture();
         if (!dispatch.dispatched) {
             finish(
+                    control.cancelled() ? StepOutcome.CANCELLED : StepOutcome.BLOCKED,
                     "Guarded stepper: blocked",
                     planDetail + "\nphaseGuard="
                             + (spec.requiresFreshPhaseGuard() ? "passed" : "skipped")
@@ -543,7 +615,7 @@ final class GuardedCombatStepper {
             return;
         }
 
-        post(Update.running(
+        postRunning(Update.running(
                 "Guarded stepper: gesture dispatched " + spec.id,
                 planDetail + "\nphaseGuard="
                         + (spec.requiresFreshPhaseGuard() ? "passed" : "skipped")
@@ -559,9 +631,11 @@ final class GuardedCombatStepper {
                 SystemClock.sleep(spec.preTapDelayMs);
             }
             for (int i = 0; i < spec.tapRepeat; i++) {
-                boolean tapped = AndroidControllerBridge.tap(spec.tapX, spec.tapY);
+                boolean tapped = performTap(spec.tapX, spec.tapY);
                 if (!tapped) {
-                    return GestureDispatch.blocked("accessibility dispatch failed at tap " + (i + 1));
+                    return GestureDispatch.blocked(control.cancelled()
+                            ? "cancelled before tap " + (i + 1)
+                            : "accessibility dispatch failed at tap " + (i + 1));
                 }
                 if (i + 1 < spec.tapRepeat) {
                     SystemClock.sleep(spec.betweenTapDelayMs);
@@ -596,13 +670,14 @@ final class GuardedCombatStepper {
             int height = template == null ? 0 : template.bitmap.getHeight();
             float x = normalized(match.x + width / 2.0f, scanFrame.getWidth());
             float y = normalized(match.y + height / 2.0f, scanFrame.getHeight());
-            boolean tapped = AndroidControllerBridge.tap(x, y);
+            boolean tapped = performTap(x, y);
             return tapped
                     ? GestureDispatch.dispatched("templateTap=" + spec.templateTapKey.id
                     + ", " + formatScan(match)
                     + ", normalizedTap=(" + x + "," + y + ")")
-                    : GestureDispatch.blocked("templateTap=" + spec.templateTapKey.id
-                    + ", accessibility dispatch failed");
+                    : GestureDispatch.blocked(control.cancelled()
+                    ? "cancelled before template tap"
+                    : "templateTap=" + spec.templateTapKey.id + ", accessibility dispatch failed");
         } catch (java.io.IOException e) {
             return GestureDispatch.blocked("template tap load failed: " + e.getMessage());
         } finally {
@@ -651,24 +726,58 @@ final class GuardedCombatStepper {
     }
 
     private void startWaiter() {
-        waiter = LiveCombatFlowWaiter.mapCustom(
+        final WaiterHandle[] publishedHandle = new WaiterHandle[1];
+        final LiveCombatFlowWaiter waiter = LiveCombatFlowWaiter.mapCustom(
                 appContext,
                 new LiveCombatFlowWaiter.Callback() {
                     @Override
                     public void onUpdate(LiveCombatFlowWaiter.Update update) {
-                        handleWaitUpdate(update);
+                        WaiterHandle source = publishedHandle[0];
+                        if (source != null) {
+                            handleWaitUpdate(source, update);
+                        }
                     }
                 },
                 spec.waitScenarioId,
                 spec.waitCurrent,
-                spec.lastAction
+                spec.lastAction,
+                control
         );
-        if (!waiter.start()) {
-            running = false;
-            post(Update.finished(
+        WaiterHandle handle = new WaiterHandle() {
+            @Override public boolean start() {
+                return waiter.start();
+            }
+
+            @Override public void cancel() {
+                waiter.cancel();
+            }
+        };
+        publishedHandle[0] = handle;
+        WaiterStartResult startResult = waiterLifecycle.publishAndStartResult(handle);
+        StepOutcome startTerminal = startResult.terminalOutcome();
+        if (startTerminal != null) {
+            postTerminal(
+                    startTerminal,
+                    "Guarded stepper: failed " + spec.id,
+                    planDetail + "\nbackground wait start failed: "
+                            + formatWaiterStartFailure(startResult.failure)
+            );
+            return;
+        }
+        WaiterStartOutcome outcome = startResult.outcome;
+        if (outcome == WaiterStartOutcome.CANCELLED) {
+            finishWaiter(
+                    handle,
+                    StepOutcome.CANCELLED,
+                    "Guarded stepper: cancelled",
+                    planDetail + "\nbackground wait cancelled before or during publication"
+            );
+        } else if (outcome == WaiterStartOutcome.REJECTED) {
+            finish(
+                    StepOutcome.BLOCKED,
                     "Guarded stepper: blocked",
                     planDetail + "\nbackground wait already running"
-            ));
+            );
         }
     }
 
@@ -696,32 +805,60 @@ final class GuardedCombatStepper {
         }
     }
 
-    private synchronized void finish(String status, String detail) {
-        running = false;
-        post(Update.finished(status, detail));
+    private void finish(StepOutcome outcome, String status, String detail) {
+        if (!waiterLifecycle.completeWithoutWaiter()) {
+            return;
+        }
+        postTerminal(outcome, status, detail);
     }
 
-    private void handleWaitUpdate(LiveCombatFlowWaiter.Update waitUpdate) {
+    private void finishWaiter(
+            WaiterHandle source,
+            StepOutcome outcome,
+            String status,
+            String detail
+    ) {
+        if (!waiterLifecycle.completeWaiter(source)) {
+            return;
+        }
+        postTerminal(outcome, status, detail);
+    }
+
+    private void handleWaitUpdate(
+            WaiterHandle source,
+            LiveCombatFlowWaiter.Update waitUpdate
+    ) {
         String detail = planDetail + "\n" + waitUpdate.detail;
         if (waitUpdate.running) {
-            post(Update.running("Guarded stepper: waiting " + spec.id, detail));
+            if (!waiterLifecycle.acceptsRunning(source)) {
+                return;
+            }
+            postRunning(Update.running("Guarded stepper: waiting " + spec.id, detail));
             return;
         }
 
-        running = false;
         if (waitUpdate.matched) {
-            post(Update.finished("Guarded stepper: wait matched " + spec.id, detail));
+            finishWaiter(source, StepOutcome.MATCHED,
+                    "Guarded stepper: wait matched " + spec.id, detail);
             return;
         }
         if (waitUpdate.cancelled) {
-            post(Update.finished("Guarded stepper: cancelled", detail));
+            finishWaiter(source, StepOutcome.CANCELLED,
+                    "Guarded stepper: cancelled", detail);
             return;
         }
         if (waitUpdate.timedOut) {
-            post(Update.finished("Guarded stepper: wait timed out " + spec.id, detail));
+            finishWaiter(source, StepOutcome.TIMED_OUT,
+                    "Guarded stepper: wait timed out " + spec.id, detail);
             return;
         }
-        post(Update.finished("Guarded stepper: failed " + spec.id, detail));
+        if (waitUpdate.failed) {
+            finishWaiter(source, StepOutcome.FAILED,
+                    "Guarded stepper: failed " + spec.id, detail);
+            return;
+        }
+        finishWaiter(source, StepOutcome.FAILED,
+                "Guarded stepper: invalid waiter terminal " + spec.id, detail);
     }
 
     private String buildPlan() {
@@ -772,26 +909,365 @@ final class GuardedCombatStepper {
         return String.format(java.util.Locale.US, "%.4f", score);
     }
 
-    private void post(final Update update) {
-        mainHandler.post(new Runnable() {
-            @Override
-            public void run() {
+    private boolean checkpoint() {
+        try {
+            return control.checkpoint();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    private static String formatWaiterStartFailure(Throwable failure) {
+        if (failure == null) {
+            return "unknown failure";
+        }
+        String message = failure.getMessage();
+        return failure.getClass().getName()
+                + (message == null || message.isEmpty() ? "" : ": " + message);
+    }
+
+    private boolean performTap(final float x, final float y) {
+        try {
+            return control.performAction(new AutomationControl.Action() {
+                @Override public boolean run() {
+                    return AndroidControllerBridge.tap(x, y);
+                }
+            });
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    private void postRunning(final Update update) {
+        final Runnable delivery = new Runnable() {
+            @Override public void run() {
                 callback.onUpdate(update);
             }
+        };
+        PublicationResult result = publicationGate.publishRunning(new PublicationAction() {
+            @Override public boolean enqueue() {
+                return mainHandler.post(delivery);
+            }
         });
+        if (result == PublicationResult.FALLBACK_CLAIMED) {
+            delivery.run();
+        }
+    }
+
+    private void postTerminal(final StepOutcome outcome, final String status,
+                              final String detail) {
+        final Runnable[] delivery = new Runnable[1];
+        PublicationResult result = publicationGate.publishTerminal(new PublicationAction() {
+            @Override public boolean enqueue() {
+                StepOutcome publishedOutcome = terminalOutcomeForPublication(
+                        publicationGate.cancelled(), outcome
+                );
+                String publishedStatus = publishedOutcome == StepOutcome.CANCELLED
+                        ? "Guarded stepper: cancelled" : status;
+                String publishedDetail = publishedOutcome == outcome
+                        ? detail : detail + "\ncancellation=won terminal race";
+                final Update update = Update.terminal(
+                        publishedOutcome, publishedStatus, publishedDetail
+                );
+                delivery[0] = new Runnable() {
+                    @Override public void run() {
+                        callback.onUpdate(update);
+                    }
+                };
+                return mainHandler.post(delivery[0]);
+            }
+        });
+        if (result == PublicationResult.FALLBACK_CLAIMED && delivery[0] != null) {
+            delivery[0].run();
+        }
+    }
+
+    static StepOutcome terminalOutcomeForPublication(
+            boolean cancelled,
+            StepOutcome requested
+    ) {
+        return cancelled ? StepOutcome.CANCELLED : requested;
     }
 
     private final class PhaseGuardDeadline implements TemplateMatcher.ScanControl {
-        private final long startedAtMs = SystemClock.elapsedRealtime();
+        private final long startedAtNanos = control.activeTimeNanos();
 
         @Override
         public boolean shouldStop() {
-            return cancelled || SystemClock.elapsedRealtime() - startedAtMs >= PHASE_GUARD_TIMEOUT_MS;
+            if (!checkpoint()) {
+                return true;
+            }
+            return java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(
+                    control.activeTimeNanos() - startedAtNanos
+            ) >= PHASE_GUARD_TIMEOUT_MS;
         }
 
         @Override
         public String stopReason() {
-            return cancelled ? "phase guard cancelled" : "phase guard timed out";
+            return control.cancelled() ? "phase guard cancelled" : "phase guard timed out";
+        }
+    }
+
+    interface PublicationAction {
+        boolean enqueue();
+    }
+
+    enum PublicationResult {
+        REJECTED,
+        ENQUEUED,
+        FALLBACK_CLAIMED
+    }
+
+    static final class PublicationGate {
+        private boolean cancelled;
+        private boolean terminalClaimed;
+
+        synchronized PublicationResult publishRunning(PublicationAction action) {
+            requireAction(action);
+            if (cancelled || terminalClaimed) {
+                return PublicationResult.REJECTED;
+            }
+            return enqueueOrClaimFallback(action);
+        }
+
+        synchronized PublicationResult publishTerminal(PublicationAction action) {
+            requireAction(action);
+            if (terminalClaimed) {
+                return PublicationResult.REJECTED;
+            }
+            terminalClaimed = true;
+            return enqueueOrClaimFallback(action);
+        }
+
+        void cancel() {
+            cancelWith(null);
+        }
+
+        synchronized void cancelWith(Runnable cancellationBarrier) {
+            if (cancellationBarrier != null) {
+                cancellationBarrier.run();
+            }
+            cancelled = true;
+        }
+
+        synchronized boolean cancelled() {
+            return cancelled;
+        }
+
+        private static PublicationResult enqueueOrClaimFallback(PublicationAction action) {
+            try {
+                return action.enqueue()
+                        ? PublicationResult.ENQUEUED
+                        : PublicationResult.FALLBACK_CLAIMED;
+            } catch (RuntimeException handlerFailure) {
+                return PublicationResult.FALLBACK_CLAIMED;
+            }
+        }
+
+        private static void requireAction(PublicationAction action) {
+            if (action == null) {
+                throw new IllegalArgumentException("publication action is required");
+            }
+        }
+    }
+
+    interface WaiterHandle {
+        boolean start();
+        void cancel();
+    }
+
+    enum WaiterStartOutcome {
+        STARTED,
+        CANCELLED,
+        REJECTED,
+        FAILED
+    }
+
+    static final class WaiterStartResult {
+        final WaiterStartOutcome outcome;
+        final Throwable failure;
+
+        private WaiterStartResult(WaiterStartOutcome outcome, Throwable failure) {
+            this.outcome = outcome;
+            this.failure = failure;
+        }
+
+        static WaiterStartResult outcome(WaiterStartOutcome outcome) {
+            return new WaiterStartResult(outcome, null);
+        }
+
+        static WaiterStartResult failure(
+                WaiterStartOutcome outcome,
+                Throwable failure
+        ) {
+            return new WaiterStartResult(outcome, failure);
+        }
+
+        StepOutcome terminalOutcome() {
+            return outcome == WaiterStartOutcome.FAILED ? StepOutcome.FAILED : null;
+        }
+    }
+
+    static final class WaiterLifecycle {
+        private WaiterHandle waiter;
+        private WaiterHandle cancelDeliveredTo;
+        private boolean cancelled;
+        private boolean running;
+        private boolean terminalCompleted;
+        private boolean startAccepted;
+
+        synchronized boolean begin() {
+            if (running || terminalCompleted || cancelled) {
+                return false;
+            }
+            running = true;
+            return true;
+        }
+
+        WaiterStartOutcome publishAndStart(WaiterHandle candidate) {
+            return publishAndStartResult(candidate).outcome;
+        }
+
+        WaiterStartResult publishAndStartResult(WaiterHandle candidate) {
+            if (candidate == null) {
+                throw new IllegalArgumentException("waiter is required");
+            }
+            boolean cancelBeforeStart;
+            boolean deliverCancellation = false;
+            synchronized (this) {
+                if (terminalCompleted || waiter != null) {
+                    return WaiterStartResult.outcome(WaiterStartOutcome.REJECTED);
+                }
+                if (!running && !cancelled) {
+                    running = true;
+                }
+                waiter = candidate;
+                startAccepted = false;
+                cancelBeforeStart = cancelled;
+                if (cancelBeforeStart && cancelDeliveredTo != candidate) {
+                    cancelDeliveredTo = candidate;
+                    deliverCancellation = true;
+                }
+            }
+
+            if (cancelBeforeStart) {
+                if (deliverCancellation) {
+                    candidate.cancel();
+                }
+                return WaiterStartResult.outcome(WaiterStartOutcome.CANCELLED);
+            }
+
+            boolean accepted;
+            try {
+                accepted = candidate.start();
+            } catch (Throwable failure) {
+                return failStart(candidate, failure);
+            }
+            synchronized (this) {
+                if (terminalCompleted || waiter != candidate) {
+                    return WaiterStartResult.outcome(cancelled
+                            ? WaiterStartOutcome.CANCELLED
+                            : WaiterStartOutcome.STARTED);
+                }
+                startAccepted = accepted;
+                if (cancelled) {
+                    return WaiterStartResult.outcome(WaiterStartOutcome.CANCELLED);
+                }
+                if (!accepted) {
+                    waiter = null;
+                    startAccepted = false;
+                    return WaiterStartResult.outcome(WaiterStartOutcome.REJECTED);
+                }
+                return WaiterStartResult.outcome(WaiterStartOutcome.STARTED);
+            }
+        }
+
+        synchronized WaiterStartResult failStart(
+                WaiterHandle candidate,
+                Throwable failure
+        ) {
+            if (candidate == null) {
+                throw new IllegalArgumentException("waiter is required");
+            }
+            if (failure == null) {
+                throw new IllegalArgumentException("start failure is required");
+            }
+            if (terminalCompleted || waiter != candidate) {
+                return WaiterStartResult.failure(WaiterStartOutcome.REJECTED, failure);
+            }
+            terminalCompleted = true;
+            running = false;
+            waiter = null;
+            startAccepted = false;
+            return WaiterStartResult.failure(WaiterStartOutcome.FAILED, failure);
+        }
+
+        void cancel() {
+            cancelWith(null);
+        }
+
+        void cancelWith(Runnable cancellationBarrier) {
+            WaiterHandle published = claimCancellationWith(cancellationBarrier);
+            if (published != null) {
+                published.cancel();
+            }
+        }
+
+        synchronized WaiterHandle claimCancellationWith(Runnable cancellationBarrier) {
+            WaiterHandle published = null;
+            if (cancellationBarrier != null) {
+                cancellationBarrier.run();
+            }
+            cancelled = true;
+            if (waiter != null && cancelDeliveredTo != waiter) {
+                cancelDeliveredTo = waiter;
+                published = waiter;
+            }
+            return published;
+        }
+
+        synchronized boolean hasActiveWaiter() {
+            return running && waiter != null && startAccepted
+                    && !cancelled && !terminalCompleted;
+        }
+
+        synchronized boolean isCurrentWaiter(WaiterHandle candidate) {
+            return running && !terminalCompleted && waiter == candidate;
+        }
+
+        synchronized boolean acceptsRunning(WaiterHandle candidate) {
+            return running && !terminalCompleted && !cancelled && waiter == candidate;
+        }
+
+        synchronized boolean completeWaiter(WaiterHandle candidate) {
+            if (candidate == null || terminalCompleted || waiter != candidate) {
+                return false;
+            }
+            terminalCompleted = true;
+            running = false;
+            waiter = null;
+            startAccepted = false;
+            return true;
+        }
+
+        synchronized boolean completeWithoutWaiter() {
+            if (terminalCompleted || waiter != null) {
+                return false;
+            }
+            terminalCompleted = true;
+            running = false;
+            startAccepted = false;
+            return true;
+        }
+
+        synchronized boolean isRunning() {
+            return running && !terminalCompleted;
+        }
+
+        synchronized boolean cancelled() {
+            return cancelled;
         }
     }
 
@@ -799,23 +1275,39 @@ final class GuardedCombatStepper {
         void onUpdate(Update update);
     }
 
+    enum StepOutcome {
+        RUNNING,
+        MATCHED,
+        BLOCKED,
+        TIMED_OUT,
+        CANCELLED,
+        FAILED
+    }
+
     static final class Update {
-        final boolean running;
+        final StepOutcome outcome;
         final String status;
         final String detail;
 
-        private Update(boolean running, String status, String detail) {
-            this.running = running;
+        private Update(StepOutcome outcome, String status, String detail) {
+            this.outcome = outcome;
             this.status = status;
             this.detail = detail;
         }
 
         static Update running(String status, String detail) {
-            return new Update(true, status, detail);
+            return new Update(StepOutcome.RUNNING, status, detail);
         }
 
-        static Update finished(String status, String detail) {
-            return new Update(false, status, detail);
+        static Update terminal(StepOutcome outcome, String status, String detail) {
+            if (outcome == StepOutcome.RUNNING) {
+                throw new IllegalArgumentException("terminal step required");
+            }
+            return new Update(outcome, status, detail);
+        }
+
+        boolean running() {
+            return outcome == StepOutcome.RUNNING;
         }
     }
 

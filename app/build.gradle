@@ -1,0 +1,45 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'org.openwsgr.autowsgrmobile'
+    compileSdk 34
+    buildToolsVersion '35.0.0'
+
+    defaultConfig {
+        applicationId 'org.openwsgr.autowsgrmobile'
+        minSdk 26
+        targetSdk 34
+        versionCode 77
+        versionName '0.77.0'
+        testInstrumentationRunner 'android.app.Instrumentation'
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled false
+        }
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    sourceSets {
+        test.java.srcDirs += ["${rootDir}/tests"]
+    }
+
+    testOptions {
+        unitTests.returnDefaultValues = true
+    }
+}
+
+dependencies {
+    testImplementation 'junit:junit:4.13.2'
+}

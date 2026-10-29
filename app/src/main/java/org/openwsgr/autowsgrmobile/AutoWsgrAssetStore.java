@@ -5,19 +5,17 @@ import android.content.res.AssetManager;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
 import java.util.List;
-import java.util.zip.ZipEntry;
-import java.util.zip.ZipInputStream;
 
 final class AutoWsgrAssetStore {
     private static final String ZIP_ASSET = "autowsgr-data.zip";
     private static final String ZIP_ROOT = "data/";
+    private static final Object INDEX_LOCK = new Object();
+
+    private static volatile ZipAssetIndex cachedIndex;
 
     private final AssetManager assets;
 
@@ -26,24 +24,7 @@ final class AutoWsgrAssetStore {
     }
 
     byte[] read(String originalPath) throws IOException {
-        String normalized = normalize(originalPath);
-        InputStream stream = assets.open(ZIP_ASSET);
-        try {
-            ZipInputStream zip = new ZipInputStream(stream);
-            try {
-                ZipEntry entry;
-                while ((entry = zip.getNextEntry()) != null) {
-                    if (!entry.isDirectory() && normalized.equals(entry.getName())) {
-                        return readAll(zip);
-                    }
-                }
-            } finally {
-                zip.close();
-            }
-        } finally {
-            stream.close();
-        }
-        throw new IOException("missing asset: " + originalPath);
+        return index().read(normalize(originalPath));
     }
 
     String readText(String originalPath) throws IOException {
@@ -52,7 +33,7 @@ final class AutoWsgrAssetStore {
 
     Bitmap readBitmap(String originalPath) throws IOException {
         byte[] data = read(originalPath);
-        Bitmap bitmap = BitmapFactory.decodeStream(new ByteArrayInputStream(data));
+        Bitmap bitmap = BitmapFactory.decodeByteArray(data, 0, data.length);
         if (bitmap == null) {
             throw new IOException("failed to decode bitmap: " + originalPath);
         }
@@ -60,24 +41,28 @@ final class AutoWsgrAssetStore {
     }
 
     List<String> listFirst(int maxItems) throws IOException {
-        List<String> paths = new ArrayList<>();
-        InputStream stream = assets.open(ZIP_ASSET);
-        try {
-            ZipInputStream zip = new ZipInputStream(stream);
-            try {
-                ZipEntry entry;
-                while ((entry = zip.getNextEntry()) != null && paths.size() < maxItems) {
-                    if (!entry.isDirectory()) {
-                        paths.add("autowsgr/" + entry.getName());
-                    }
-                }
-            } finally {
-                zip.close();
-            }
-        } finally {
-            stream.close();
+        List<String> indexed = index().listFirst(maxItems);
+        java.util.ArrayList<String> paths = new java.util.ArrayList<>(indexed.size());
+        for (String path : indexed) {
+            paths.add("autowsgr/" + path);
         }
         return paths;
+    }
+
+    private ZipAssetIndex index() throws IOException {
+        ZipAssetIndex available = cachedIndex;
+        if (available != null) {
+            return available;
+        }
+        synchronized (INDEX_LOCK) {
+            available = cachedIndex;
+            if (available == null) {
+                InputStream input = assets.open(ZIP_ASSET);
+                available = ZipAssetIndex.load(input);
+                cachedIndex = available;
+            }
+            return available;
+        }
     }
 
     private static String normalize(String originalPath) {
@@ -91,13 +76,4 @@ final class AutoWsgrAssetStore {
         return path;
     }
 
-    private static byte[] readAll(InputStream input) throws IOException {
-        ByteArrayOutputStream output = new ByteArrayOutputStream();
-        byte[] buffer = new byte[16 * 1024];
-        int n;
-        while ((n = input.read(buffer)) >= 0) {
-            output.write(buffer, 0, n);
-        }
-        return output.toByteArray();
-    }
 }

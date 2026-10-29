@@ -3,3 +3,6 @@ build/
 *.apk
 *.idsig
 local.properties
+.worktrees/
+.gradle/
+app/build/

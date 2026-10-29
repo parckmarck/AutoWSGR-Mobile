@@ -64,9 +64,11 @@ final class ShipDamageRecognizer {
             return new ProbeResult(ok, detail.toString());
         }
 
+        Bitmap gameFrame = null;
         try {
-            Detection preparation = detectPreparation(liveFrame);
-            Detection result = detectResult(liveFrame, null);
+            gameFrame = GameFrameNormalizer.toLandscapeGameFrame(liveFrame);
+            Detection preparation = detectPreparation(gameFrame);
+            Detection result = detectResult(gameFrame, null);
             Detection best = better(preparation, result);
             append(detail, "live preparation=" + preparation.detailLine());
             append(detail, "live result=" + result.detailLine());
@@ -75,6 +77,9 @@ final class ShipDamageRecognizer {
                     + ", snapshot=" + best.snapshot.shortLabel());
             return new ProbeResult(ok, detail.toString());
         } finally {
+            if (gameFrame != null) {
+                gameFrame.recycle();
+            }
             liveFrame.recycle();
         }
     }

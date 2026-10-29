@@ -25,6 +25,7 @@ import android.widget.Spinner;
 import android.widget.TextView;
 
 import java.io.BufferedReader;
+import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
@@ -75,10 +76,6 @@ public final class MainActivity extends Activity {
     private TextView guardedRunnerDetail;
     private String lastLiveSpotDiagnosticsStatus = "";
     private String lastLiveSpotDiagnosticsDetail = "";
-    private LiveCombatFlowWaiter liveCombatFlowWaiter;
-    private boolean liveCombatWaitCancelRequested;
-    private GuardedCombatStepper guardedCombatStepper;
-    private GuardedCombatRunner guardedCombatRunner;
     private TextView minimumRunStatus;
     private TextView minimumRunDetail;
     private TextView minimumRunLogPath;
@@ -86,16 +83,66 @@ public final class MainActivity extends Activity {
     private Spinner sortieChapterSpinner;
     private Spinner sortieMapSpinner;
     private TextView sortieTargetDetail;
-    private TextView sortieConfigStatus;
     private NormalMapCatalog normalMapCatalog;
-    private MinimumNormalBattleRunner minimumNormalBattleRunner;
-    private AutoExpeditionSchedulerRunner autoExpeditionSchedulerRunner;
+    private ConfigProfileRepository configProfileRepository;
+    private ConfigProfileUiController configProfileUiController;
+    private UnifiedAutomationConfig activeAutomationConfig;
+    private String activeConfigProfileId = ConfigProfileRepository.BUILTIN_ID;
+    private AutomationRuntime runtime;
+    private final AutomationRuntime.Listener automationListener = new AutomationRuntime.Listener() {
+        @Override public void onAutomationUpdate(AutomationUpdate update) {
+            renderAutomationUpdate(update);
+        }
+    };
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        runtime = ((AutoWsgrApplication) getApplication()).automationRuntime();
+        File externalDirectory = getExternalFilesDir(null);
+        File baseDirectory = externalDirectory == null ? getFilesDir() : externalDirectory;
+        File configsDirectory = new File(baseDirectory, "configs");
+        configProfileRepository = new ConfigProfileRepository(
+                configsDirectory,
+                DefaultUnifiedConfig.text(),
+                new FileActiveProfileStore(new File(configsDirectory, "active-profile.txt")),
+                new CurrentConfigProfileValidator()
+        );
+        Exception importError = null;
+        try {
+            LegacyConfigProfileImporter.importIfNeeded(
+                    configProfileRepository,
+                    new File(baseDirectory, "config")
+            );
+        } catch (IOException error) {
+            importError = error;
+        }
+        configProfileUiController = new ConfigProfileUiController(
+                this,
+                configProfileRepository,
+                new ConfigProfileUiController.Listener() {
+                    @Override public void onDefaultProfileChanged(
+                            ConfigProfile profile,
+                            UnifiedAutomationConfig config
+                    ) {
+                        activeAutomationConfig = config;
+                        activeConfigProfileId = profile.id;
+                    }
+                }
+        );
         setContentView(buildUi());
+        configProfileUiController.loadActive();
+        if (importError != null) {
+            configProfileUiController.showError(importError);
+        }
+        configProfileUiController.restoreInstanceState(savedInstanceState);
         requestNotificationPermissionIfNeeded();
+    }
+
+    @Override
+    protected void onSaveInstanceState(Bundle outState) {
+        configProfileUiController.saveInstanceState(outState);
+        super.onSaveInstanceState(outState);
     }
 
     @Override
@@ -105,12 +152,19 @@ public final class MainActivity extends Activity {
     }
 
     @Override
+    protected void onStart() {
+        super.onStart();
+        runtime.addListener(automationListener, true);
+    }
+
+    @Override
+    protected void onStop() {
+        runtime.removeListener(automationListener);
+        super.onStop();
+    }
+
+    @Override
     protected void onDestroy() {
-        cancelAutoExpeditionSchedulerSilently();
-        cancelMinimumNormalRunnerSilently();
-        cancelGuardedRunner();
-        cancelLiveCombatWait();
-        cancelGuardedStepper();
         super.onDestroy();
     }
 
@@ -158,6 +212,11 @@ public final class MainActivity extends Activity {
         );
         subtitle.setPadding(0, dp(8), 0, dp(14));
         root.addView(subtitle);
+
+        TextView configHeading = text("配置档案", 18, 0xFF263238, true);
+        configHeading.setPadding(0, dp(8), 0, dp(6));
+        root.addView(configHeading);
+        root.addView(configProfileUiController.buildView());
 
         captureStatus = statusText();
         accessibilityStatus = statusText();
@@ -235,12 +294,6 @@ public final class MainActivity extends Activity {
                 refreshStatus();
             }
         }));
-        root.addView(button("写入默认出征配置", new View.OnClickListener() {
-            @Override
-            public void onClick(View view) {
-                writeDefaultSortieConfig();
-            }
-        }));
         root.addView(button("运行索敌画面诊断", new View.OnClickListener() {
             @Override
             public void onClick(View view) {
@@ -283,10 +336,30 @@ public final class MainActivity extends Activity {
                 runAutoExpeditionScheduler();
             }
         }));
+        root.addView(button("战役", new View.OnClickListener() {
+            @Override
+            public void onClick(View view) {
+                runCampaignBattle();
+            }
+        }));
         root.addView(button("停止当前流程", new View.OnClickListener() {
             @Override
             public void onClick(View view) {
                 cancelCurrentFlow();
+            }
+        }));
+        root.addView(button("暂停当前流程", new View.OnClickListener() {
+            @Override public void onClick(View view) {
+                if (!runtime.pauseActive()) {
+                    minimumRunStatus.setText("当前流程不支持暂停或没有运行中的流程");
+                }
+            }
+        }));
+        root.addView(button("继续当前流程", new View.OnClickListener() {
+            @Override public void onClick(View view) {
+                if (!runtime.resumeActive()) {
+                    minimumRunStatus.setText("当前流程不支持继续或没有运行中的流程");
+                }
             }
         }));
 
@@ -370,8 +443,6 @@ public final class MainActivity extends Activity {
 
         sortieTargetDetail = statusText();
         root.addView(sortieTargetDetail);
-        sortieConfigStatus = statusText();
-        root.addView(sortieConfigStatus);
 
         String[] chapters = normalMapCatalog.chapterLabels();
         if (chapters.length == 0) {
@@ -434,7 +505,6 @@ public final class MainActivity extends Activity {
         NormalSortieTarget target = selectedNormalSortieTarget();
         sortieTargetDetail.setText("普通图：" + target.label()
                 + "，地图：" + target.mapAssetPath());
-        refreshSortieConfigStatus();
     }
 
     private NormalSortieTarget selectedNormalSortieTarget() {
@@ -504,7 +574,6 @@ public final class MainActivity extends Activity {
         frameStatus.setText("画面帧：" + snapshot.toStatusLine());
         pixelStatus.setText(AndroidControllerBridge.centerPixelStatus());
         runnerStatus.setText("运行状态：核心诊断、策略自检和受保护一步执行已就绪；高级调试入口已隐藏");
-        refreshSortieConfigStatus();
         if (TextUtils.isEmpty(selfTestStatus.getText())) {
             selfTestStatus.setText("Runtime self-test: not run");
         }
@@ -702,453 +771,443 @@ public final class MainActivity extends Activity {
     }
 
     private void startSpotFightWait() {
-        startLiveCombatWait(LiveCombatFlowWaiter.mapSpotFight(this, liveCombatWaitCallback()));
+        String runId = diagnosticRunId();
+        startLiveCombatWait(LiveCombatFlowWaiter.mapSpotFight(
+                getApplicationContext(), liveCombatWaitCallback(runtime, runId)
+        ));
     }
 
     private void startMapStartWait() {
-        startLiveCombatWait(LiveCombatFlowWaiter.mapStart(this, liveCombatWaitCallback()));
+        String runId = diagnosticRunId();
+        startLiveCombatWait(LiveCombatFlowWaiter.mapStart(
+                getApplicationContext(), liveCombatWaitCallback(runtime, runId)
+        ));
     }
 
     private void startResultWait() {
-        startLiveCombatWait(LiveCombatFlowWaiter.mapResult(this, liveCombatWaitCallback()));
+        String runId = diagnosticRunId();
+        startLiveCombatWait(LiveCombatFlowWaiter.mapResult(
+                getApplicationContext(), liveCombatWaitCallback(runtime, runId)
+        ));
     }
 
     private void startProceedNoWait() {
-        startLiveCombatWait(LiveCombatFlowWaiter.mapProceedNo(this, liveCombatWaitCallback()));
+        String runId = diagnosticRunId();
+        startLiveCombatWait(LiveCombatFlowWaiter.mapProceedNo(
+                getApplicationContext(), liveCombatWaitCallback(runtime, runId)
+        ));
     }
 
-    private void startLiveCombatWait(LiveCombatFlowWaiter waiter) {
-        if (isAutoExpeditionRunning()) {
-            liveCombatWaitStatus.setText("等待任务：自动远征正在运行");
-            return;
-        }
-        if (liveCombatFlowWaiter != null && liveCombatFlowWaiter.isRunning()) {
-            liveCombatWaitStatus.setText("Live combat wait: already running");
-            return;
-        }
-        if (guardedCombatRunner != null && guardedCombatRunner.isRunning()) {
-            liveCombatWaitStatus.setText("Live combat wait: blocked by active guarded runner");
-            return;
-        }
-        liveCombatFlowWaiter = waiter;
-        liveCombatWaitCancelRequested = false;
-        liveCombatWaitStatus.setText("Live combat wait: starting");
-        if (!liveCombatFlowWaiter.start()) {
-            liveCombatWaitStatus.setText("Live combat wait: already running");
-        }
+    private void startLiveCombatWait(final LiveCombatFlowWaiter waiter) {
+        RunnerAutomationFlow flow = new RunnerAutomationFlow(
+                "waiter", "作战等待", false,
+                new RunnerAutomationFlow.Start() {
+                    @Override public boolean start() { return waiter.start(); }
+                },
+                null,
+                null,
+                new RunnerAutomationFlow.Cancel() {
+                    @Override public void cancel() { waiter.cancel(); }
+                },
+                new RunnerAutomationFlow.Running() {
+                    @Override public boolean isRunning() { return waiter.isRunning(); }
+                }
+        );
+        startAutomationFlow(flow, liveCombatWaitStatus);
     }
 
-    private LiveCombatFlowWaiter.Callback liveCombatWaitCallback() {
+    private static LiveCombatFlowWaiter.Callback liveCombatWaitCallback(
+            final AutomationRuntime target,
+            final String runId
+    ) {
         return new LiveCombatFlowWaiter.Callback() {
-            @Override
-            public void onUpdate(LiveCombatFlowWaiter.Update update) {
-                if (liveCombatWaitCancelRequested && update.running) {
+            @Override public void onUpdate(LiveCombatFlowWaiter.Update update) {
+                String message = update.toStatusLine();
+                if (update.running) {
+                    target.onUpdate(AutomationUpdate.progress(
+                            "waiter", runId, message, update.detail, "", ""
+                    ));
                     return;
                 }
-                if (liveCombatWaitCancelRequested && update.timedOut) {
-                    liveCombatWaitStatus.setText("Live combat wait: cancelled after " + update.elapsedMs + "ms");
-                    liveCombatWaitDetail.setText(update.detail + "\nuser cancellation requested");
-                    liveCombatWaitCancelRequested = false;
-                    liveCombatFlowWaiter = null;
-                    return;
+                AutomationOutcome outcome;
+                if (update.matched) {
+                    outcome = AutomationOutcome.SUCCESS;
+                } else if (update.cancelled) {
+                    outcome = AutomationOutcome.CANCELLED;
+                } else if (update.timedOut) {
+                    outcome = AutomationOutcome.BLOCKED;
+                } else if (update.failed) {
+                    outcome = AutomationOutcome.FAILED;
+                } else {
+                    outcome = AutomationOutcome.BLOCKED;
                 }
-                liveCombatWaitStatus.setText(update.toStatusLine());
-                liveCombatWaitDetail.setText(update.detail);
-                if (!update.running) {
-                    liveCombatWaitCancelRequested = false;
-                    liveCombatFlowWaiter = null;
-                }
+                target.onUpdate(AutomationUpdate.terminal(
+                        "waiter", runId, outcome, message, update.detail, "", ""
+                ));
             }
         };
-    }
-
-    private void cancelLiveCombatWait() {
-        if (liveCombatFlowWaiter == null) {
-            return;
-        }
-        liveCombatWaitCancelRequested = true;
-        liveCombatWaitStatus.setText("Live combat wait: cancelled by user");
-        liveCombatWaitDetail.setText("cancel requested");
-        liveCombatFlowWaiter.cancel();
     }
 
     private void runGuardedProceedNoDryRun() {
-        startGuardedStepper(GuardedCombatStepper.proceedNoDryRun(this, guardedStepperCallback()));
+        startGuardedStepper(GuardedCombatStepper.proceedNoDryRun(
+                getApplicationContext(), guardedStepperCallback(runtime, diagnosticRunId())
+        ));
     }
 
     private void runGuardedProceedNoExecuteGuarded() {
-        startGuardedStepper(GuardedCombatStepper.proceedNoExecuteGuarded(this, guardedStepperCallback()));
+        startGuardedStepper(GuardedCombatStepper.proceedNoExecuteGuarded(
+                getApplicationContext(), guardedStepperCallback(runtime, diagnosticRunId())
+        ));
     }
 
     private void runGuardedSpotFightDryRun() {
-        startGuardedStepper(GuardedCombatStepper.spotFightDryRun(this, guardedStepperCallback()));
+        startGuardedStepper(GuardedCombatStepper.spotFightDryRun(
+                getApplicationContext(), guardedStepperCallback(runtime, diagnosticRunId())
+        ));
     }
 
     private void runGuardedSpotFightExecuteGuarded() {
-        startGuardedStepper(GuardedCombatStepper.spotFightExecuteGuarded(this, guardedStepperCallback()));
+        startGuardedStepper(GuardedCombatStepper.spotFightExecuteGuarded(
+                getApplicationContext(), guardedStepperCallback(runtime, diagnosticRunId())
+        ));
     }
 
     private void runGuardedSpotRetreatDryRun() {
-        startGuardedStepper(GuardedCombatStepper.spotRetreatDryRun(this, guardedStepperCallback()));
+        startGuardedStepper(GuardedCombatStepper.spotRetreatDryRun(
+                getApplicationContext(), guardedStepperCallback(runtime, diagnosticRunId())
+        ));
     }
 
     private void runGuardedSpotRetreatExecuteGuarded() {
-        startGuardedStepper(GuardedCombatStepper.spotRetreatExecuteGuarded(this, guardedStepperCallback()));
+        startGuardedStepper(GuardedCombatStepper.spotRetreatExecuteGuarded(
+                getApplicationContext(), guardedStepperCallback(runtime, diagnosticRunId())
+        ));
     }
 
     private void runGuardedSpotDetourDryRun() {
-        startGuardedStepper(GuardedCombatStepper.spotDetourDryRun(this, guardedStepperCallback()));
+        startGuardedStepper(GuardedCombatStepper.spotDetourDryRun(
+                getApplicationContext(), guardedStepperCallback(runtime, diagnosticRunId())
+        ));
     }
 
     private void runGuardedSpotDetourExecuteGuarded() {
-        startGuardedStepper(GuardedCombatStepper.spotDetourExecuteGuarded(this, guardedStepperCallback()));
+        startGuardedStepper(GuardedCombatStepper.spotDetourExecuteGuarded(
+                getApplicationContext(), guardedStepperCallback(runtime, diagnosticRunId())
+        ));
     }
 
     private void runGuardedFightConditionAimDryRun() {
-        startGuardedStepper(GuardedCombatStepper.fightConditionAimDryRun(this, guardedStepperCallback()));
+        startGuardedStepper(GuardedCombatStepper.fightConditionAimDryRun(
+                getApplicationContext(), guardedStepperCallback(runtime, diagnosticRunId())
+        ));
     }
 
     private void runGuardedFightConditionAimExecuteGuarded() {
-        startGuardedStepper(GuardedCombatStepper.fightConditionAimExecuteGuarded(this, guardedStepperCallback()));
+        startGuardedStepper(GuardedCombatStepper.fightConditionAimExecuteGuarded(
+                getApplicationContext(), guardedStepperCallback(runtime, diagnosticRunId())
+        ));
     }
 
     private void runGuardedFormationDryRun() {
-        startGuardedStepper(GuardedCombatStepper.formationSingleColumnDryRun(this, guardedStepperCallback()));
+        startGuardedStepper(GuardedCombatStepper.formationSingleColumnDryRun(
+                getApplicationContext(), guardedStepperCallback(runtime, diagnosticRunId())
+        ));
     }
 
     private void runGuardedFormationExecuteGuarded() {
-        startGuardedStepper(GuardedCombatStepper.formationSingleColumnExecuteGuarded(this, guardedStepperCallback()));
+        startGuardedStepper(GuardedCombatStepper.formationSingleColumnExecuteGuarded(
+                getApplicationContext(), guardedStepperCallback(runtime, diagnosticRunId())
+        ));
     }
 
     private void runGuardedMissileSkipDryRun() {
-        startGuardedStepper(GuardedCombatStepper.missileSkipDryRun(this, guardedStepperCallback()));
+        startGuardedStepper(GuardedCombatStepper.missileSkipDryRun(
+                getApplicationContext(), guardedStepperCallback(runtime, diagnosticRunId())
+        ));
     }
 
     private void runGuardedMissileSkipExecuteGuarded() {
-        startGuardedStepper(GuardedCombatStepper.missileSkipExecuteGuarded(this, guardedStepperCallback()));
+        startGuardedStepper(GuardedCombatStepper.missileSkipExecuteGuarded(
+                getApplicationContext(), guardedStepperCallback(runtime, diagnosticRunId())
+        ));
     }
 
     private void runGuardedNightNoDryRun() {
-        startGuardedStepper(GuardedCombatStepper.nightNoDryRun(this, guardedStepperCallback()));
+        startGuardedStepper(GuardedCombatStepper.nightNoDryRun(
+                getApplicationContext(), guardedStepperCallback(runtime, diagnosticRunId())
+        ));
     }
 
     private void runGuardedNightNoExecuteGuarded() {
-        startGuardedStepper(GuardedCombatStepper.nightNoExecuteGuarded(this, guardedStepperCallback()));
+        startGuardedStepper(GuardedCombatStepper.nightNoExecuteGuarded(
+                getApplicationContext(), guardedStepperCallback(runtime, diagnosticRunId())
+        ));
     }
 
     private void runGuardedResultDryRun() {
-        startGuardedStepper(GuardedCombatStepper.resultContinueDryRun(this, guardedStepperCallback()));
+        startGuardedStepper(GuardedCombatStepper.resultContinueDryRun(
+                getApplicationContext(), guardedStepperCallback(runtime, diagnosticRunId())
+        ));
     }
 
     private void runGuardedResultExecuteGuarded() {
-        startGuardedStepper(GuardedCombatStepper.resultContinueExecuteGuarded(this, guardedStepperCallback()));
+        startGuardedStepper(GuardedCombatStepper.resultContinueExecuteGuarded(
+                getApplicationContext(), guardedStepperCallback(runtime, diagnosticRunId())
+        ));
     }
 
-    private void startGuardedStepper(GuardedCombatStepper stepper) {
-        if (isAutoExpeditionRunning()) {
-            guardedStepperStatus.setText("单步作战：自动远征正在运行");
-            return;
-        }
-        if (minimumNormalBattleRunner != null && minimumNormalBattleRunner.isRunning()) {
-            guardedStepperStatus.setText("Guarded stepper: blocked by active minimum normal battle");
-            return;
-        }
-        if (guardedCombatStepper != null && guardedCombatStepper.isRunning()) {
-            guardedStepperStatus.setText("Guarded stepper: already running");
-            return;
-        }
-        if (liveCombatFlowWaiter != null && liveCombatFlowWaiter.isRunning()) {
-            guardedStepperStatus.setText("Guarded stepper: blocked by active live wait");
-            return;
-        }
-        if (guardedCombatRunner != null && guardedCombatRunner.isRunning()) {
-            guardedStepperStatus.setText("Guarded stepper: blocked by active guarded runner");
-            return;
-        }
-        guardedCombatStepper = stepper;
-        if (!guardedCombatStepper.start()) {
-            guardedStepperStatus.setText("Guarded stepper: already running");
-        }
-    }
-
-    private GuardedCombatStepper.Callback guardedStepperCallback() {
-        return new GuardedCombatStepper.Callback() {
-            @Override
-            public void onUpdate(GuardedCombatStepper.Update update) {
-                guardedStepperStatus.setText(update.status);
-                guardedStepperDetail.setText(update.detail);
-                if (!update.running) {
-                    guardedCombatStepper = null;
+    private void startGuardedStepper(final GuardedCombatStepper stepper) {
+        RunnerAutomationFlow flow = new RunnerAutomationFlow(
+                "stepper", "单步作战", true,
+                new RunnerAutomationFlow.Start() {
+                    @Override public boolean start() { return stepper.start(); }
+                },
+                new RunnerAutomationFlow.Pause() {
+                    @Override public void pause() { stepper.pause(); }
+                },
+                new RunnerAutomationFlow.Resume() {
+                    @Override public void resume() { stepper.resume(); }
+                },
+                new RunnerAutomationFlow.Cancel() {
+                    @Override public void cancel() { stepper.cancel(); }
+                },
+                new RunnerAutomationFlow.Running() {
+                    @Override public boolean isRunning() { return stepper.isRunning(); }
                 }
+        );
+        startAutomationFlow(flow, guardedStepperStatus);
+    }
+
+    private static GuardedCombatStepper.Callback guardedStepperCallback(
+            final AutomationRuntime target,
+            final String runId
+    ) {
+        return new GuardedCombatStepper.Callback() {
+            @Override public void onUpdate(GuardedCombatStepper.Update update) {
+                if (update.running()) {
+                    target.onUpdate(AutomationUpdate.progress(
+                            "stepper", runId, update.status, update.detail, "", ""
+                    ));
+                    return;
+                }
+                AutomationOutcome outcome;
+                switch (update.outcome) {
+                    case MATCHED:
+                        outcome = AutomationOutcome.SUCCESS;
+                        break;
+                    case CANCELLED:
+                        outcome = AutomationOutcome.CANCELLED;
+                        break;
+                    case FAILED:
+                        outcome = AutomationOutcome.FAILED;
+                        break;
+                    case BLOCKED:
+                    case TIMED_OUT:
+                    case RUNNING:
+                    default:
+                        outcome = AutomationOutcome.BLOCKED;
+                        break;
+                }
+                target.onUpdate(AutomationUpdate.terminal(
+                        "stepper", runId, outcome, update.status, update.detail, "", ""
+                ));
             }
         };
-    }
-
-    private void cancelGuardedStepper() {
-        if (guardedCombatStepper == null) {
-            return;
-        }
-        guardedStepperStatus.setText("Guarded stepper: cancel requested");
-        guardedStepperDetail.setText("cancel requested");
-        guardedCombatStepper.cancel();
     }
 
     private void runGuardedRunnerOneStep() {
-        startGuardedRunner(GuardedCombatRunner.oneStepExecuteGuarded(this, guardedRunnerCallback()));
+        startGuardedRunner(true);
     }
 
     private void runGuardedRunnerFiveStepLoop() {
-        startGuardedRunner(GuardedCombatRunner.boundedLoopExecuteGuarded(this, guardedRunnerCallback()));
+        startGuardedRunner(false);
     }
 
-    private void startGuardedRunner(GuardedCombatRunner runner) {
-        if (isAutoExpeditionRunning()) {
-            guardedRunnerStatus.setText("受保护作战：自动远征正在运行");
-            return;
-        }
-        if (minimumNormalBattleRunner != null && minimumNormalBattleRunner.isRunning()) {
-            guardedRunnerStatus.setText("受保护作战：被最小普通战占用");
-            return;
-        }
-        if (guardedCombatRunner != null && guardedCombatRunner.isRunning()) {
-            guardedRunnerStatus.setText("受保护作战：正在运行");
-            return;
-        }
-        if (guardedCombatStepper != null && guardedCombatStepper.isRunning()) {
-            guardedRunnerStatus.setText("受保护作战：被单步任务占用");
-            return;
-        }
-        if (liveCombatFlowWaiter != null && liveCombatFlowWaiter.isRunning()) {
-            guardedRunnerStatus.setText("受保护作战：被等待任务占用");
-            return;
-        }
-        guardedCombatRunner = runner;
-        if (!guardedCombatRunner.start()) {
-            guardedRunnerStatus.setText("受保护作战：正在运行");
-        }
-    }
-
-    private GuardedCombatRunner.Callback guardedRunnerCallback() {
-        return new GuardedCombatRunner.Callback() {
-            @Override
-            public void onUpdate(GuardedCombatRunner.Update update) {
-                guardedRunnerStatus.setText(zhGuardedRunnerStatus(update.status));
-                guardedRunnerDetail.setText(update.detail);
-                if (!update.running) {
-                    guardedCombatRunner = null;
+    private void startGuardedRunner(boolean oneStep) {
+        final GuardedCombatRunner runner = oneStep
+                ? GuardedCombatRunner.oneStepExecuteGuarded(getApplicationContext(), runtime)
+                : GuardedCombatRunner.boundedLoopExecuteGuarded(getApplicationContext(), runtime);
+        RunnerAutomationFlow flow = new RunnerAutomationFlow(
+                "guarded", "受保护作战", true,
+                new RunnerAutomationFlow.Start() {
+                    @Override public boolean start() { return runner.start(); }
+                },
+                new RunnerAutomationFlow.Pause() {
+                    @Override public void pause() { runner.pause(); }
+                },
+                new RunnerAutomationFlow.Resume() {
+                    @Override public void resume() { runner.resume(); }
+                },
+                new RunnerAutomationFlow.Cancel() {
+                    @Override public void cancel() { runner.cancel(); }
+                },
+                new RunnerAutomationFlow.Running() {
+                    @Override public boolean isRunning() { return runner.isRunning(); }
                 }
-            }
-        };
-    }
-
-    private void cancelGuardedRunner() {
-        if (guardedCombatRunner == null) {
-            return;
-        }
-        guardedRunnerStatus.setText("受保护作战：已请求停止");
-        guardedRunnerDetail.setText("cancel requested");
-        guardedCombatRunner.cancel();
-    }
-
-    private void refreshSortieConfigStatus() {
-        if (sortieConfigStatus == null) {
-            return;
-        }
-        sortieConfigStatus.setText(NormalSortieConfigStore.statusLine(this));
-    }
-
-    private void writeDefaultSortieConfig() {
-        try {
-            NormalSortieConfigStore.LoadResult result = NormalSortieConfigStore.writeDefault(this);
-            sortieConfigStatus.setText("出征配置：" + result.detail);
-        } catch (IOException e) {
-            sortieConfigStatus.setText("出征配置：写入失败，" + e.getMessage());
-        }
+        );
+        startAutomationFlow(flow, guardedRunnerStatus);
     }
 
     private void runMinimumNormalBattle() {
-        if (minimumNormalBattleRunner != null && minimumNormalBattleRunner.isRunning()) {
-            minimumRunStatus.setText("最小普通战：正在运行");
+        UnifiedAutomationConfig activeConfig = activeConfigOrBlockStart();
+        if (activeConfig == null) {
             return;
         }
-        if (isAutoExpeditionRunning()) {
-            minimumRunStatus.setText("最小普通战：自动远征正在运行");
-            return;
-        }
-        if (guardedCombatRunner != null && guardedCombatRunner.isRunning()) {
-            minimumRunStatus.setText("最小普通战：受保护作战正在运行");
-            return;
-        }
-        if (guardedCombatStepper != null && guardedCombatStepper.isRunning()) {
-            minimumRunStatus.setText("最小普通战：单步作战正在运行");
-            return;
-        }
-        if (liveCombatFlowWaiter != null && liveCombatFlowWaiter.isRunning()) {
-            minimumRunStatus.setText("最小普通战：等待任务正在运行");
-            return;
-        }
-        NormalSortieConfigStore.LoadResult configResult;
-        try {
-            configResult = NormalSortieConfigStore.loadOrCreateDefault(this);
-        } catch (IOException e) {
-            minimumRunStatus.setText("最小普通战：配置不可用");
-            minimumRunDetail.setText(e.getMessage());
-            refreshSortieConfigStatus();
-            return;
-        }
-        sortieConfigStatus.setText("出征配置：" + configResult.detail);
-        minimumNormalBattleRunner = new MinimumNormalBattleRunner(this, configResult.config, minimumRunnerCallback());
+        final MinimumNormalBattleRunner runner = new MinimumNormalBattleRunner(
+                getApplicationContext(), activeConfig.normalSortie, runtime
+        );
+        RunnerAutomationFlow flow = new RunnerAutomationFlow(
+                "normal", "最小普通战", true,
+                new RunnerAutomationFlow.Start() {
+                    @Override public boolean start() { return runner.start(); }
+                },
+                new RunnerAutomationFlow.Pause() {
+                    @Override public void pause() { runner.pause(); }
+                },
+                new RunnerAutomationFlow.Resume() {
+                    @Override public void resume() { runner.resume(); }
+                },
+                new RunnerAutomationFlow.Cancel() {
+                    @Override public void cancel() { runner.cancel(); }
+                },
+                new RunnerAutomationFlow.Running() {
+                    @Override public boolean isRunning() { return runner.isRunning(); }
+                }
+        );
         minimumRunStatus.setText("最小普通战：启动中");
-        minimumRunDetail.setText("出征配置：" + configResult.file.getAbsolutePath());
+        minimumRunDetail.setText("默认配置：" + activeConfigProfileId);
         minimumRunLogPath.setText("运行日志：准备生成");
         minimumRunScreenshotPath.setText("失败截图：未生成");
-        if (!minimumNormalBattleRunner.start()) {
-            minimumRunStatus.setText("最小普通战：正在运行");
-        }
+        startAutomationFlow(flow, minimumRunStatus);
     }
 
     private void runAutoExpeditionScheduler() {
-        if (isAutoExpeditionRunning()) {
-            minimumRunStatus.setText("自动远征：正在运行");
+        UnifiedAutomationConfig activeConfig = activeConfigOrBlockStart();
+        if (activeConfig == null) {
             return;
         }
-        if (minimumNormalBattleRunner != null && minimumNormalBattleRunner.isRunning()) {
-            minimumRunStatus.setText("自动远征：最小普通战正在运行");
-            return;
-        }
-        if (guardedCombatRunner != null && guardedCombatRunner.isRunning()) {
-            minimumRunStatus.setText("自动远征：受保护作战正在运行");
-            return;
-        }
-        if (guardedCombatStepper != null && guardedCombatStepper.isRunning()) {
-            minimumRunStatus.setText("自动远征：单步作战正在运行");
-            return;
-        }
-        if (liveCombatFlowWaiter != null && liveCombatFlowWaiter.isRunning()) {
-            minimumRunStatus.setText("自动远征：等待任务正在运行");
-            return;
-        }
-        AutoExpeditionConfigStore.LoadResult configResult;
-        try {
-            configResult = AutoExpeditionConfigStore.loadOrCreateDefault(this);
-        } catch (IOException e) {
-            minimumRunStatus.setText("自动远征：配置不可用");
-            minimumRunDetail.setText(e.getMessage());
-            return;
-        }
-        autoExpeditionSchedulerRunner = new AutoExpeditionSchedulerRunner(
-                this,
-                configResult.config,
-                autoExpeditionCallback()
+        final AutoExpeditionSchedulerRunner runner = new AutoExpeditionSchedulerRunner(
+                getApplicationContext(), activeConfig.autoExpedition, runtime
+        );
+        RunnerAutomationFlow flow = new RunnerAutomationFlow(
+                "expedition", "自动远征", true,
+                new RunnerAutomationFlow.Start() {
+                    @Override public boolean start() { return runner.start(); }
+                },
+                new RunnerAutomationFlow.Pause() {
+                    @Override public void pause() { runner.pause(); }
+                },
+                new RunnerAutomationFlow.Resume() {
+                    @Override public void resume() { runner.resume(); }
+                },
+                new RunnerAutomationFlow.Cancel() {
+                    @Override public void cancel() { runner.cancel(); }
+                },
+                new RunnerAutomationFlow.Running() {
+                    @Override public boolean isRunning() { return runner.isRunning(); }
+                }
         );
         minimumRunStatus.setText("自动远征：启动中");
-        minimumRunDetail.setText("远征配置：" + configResult.detail);
+        minimumRunDetail.setText("默认配置：" + activeConfigProfileId
+                + "，远征间隔：" + activeConfig.autoExpedition.intervalSeconds + " 秒");
         minimumRunLogPath.setText("运行日志：准备生成");
         minimumRunScreenshotPath.setText("失败截图：未生成");
-        if (!autoExpeditionSchedulerRunner.start()) {
-            if (configResult.config.enabled()) {
-                minimumRunStatus.setText("自动远征：正在运行");
-            } else {
-                autoExpeditionSchedulerRunner = null;
-            }
-        }
+        startAutomationFlow(flow, minimumRunStatus);
     }
 
     private void cancelCurrentFlow() {
-        if (isAutoExpeditionRunning()) {
-            cancelAutoExpeditionScheduler();
-            return;
-        }
-        if (minimumNormalBattleRunner != null && minimumNormalBattleRunner.isRunning()) {
-            cancelMinimumNormalBattle();
-            return;
-        }
-        if (guardedCombatRunner != null && guardedCombatRunner.isRunning()) {
-            cancelGuardedRunner();
-            minimumRunStatus.setText("最小普通战：已请求停止受保护作战");
-            return;
-        }
-        if (liveCombatFlowWaiter != null && liveCombatFlowWaiter.isRunning()) {
-            cancelLiveCombatWait();
-            minimumRunStatus.setText("最小普通战：已请求停止等待任务");
-            return;
-        }
-        if (guardedCombatStepper != null && guardedCombatStepper.isRunning()) {
-            cancelGuardedStepper();
-            minimumRunStatus.setText("最小普通战：已请求停止单步任务");
-            return;
-        }
-        minimumRunStatus.setText("最小普通战：没有运行中的流程");
-    }
-
-    private void cancelAutoExpeditionScheduler() {
-        if (autoExpeditionSchedulerRunner == null) {
-            minimumRunStatus.setText("自动远征：没有运行中的流程");
-            return;
-        }
-        minimumRunStatus.setText("自动远征：请求停止");
-        autoExpeditionSchedulerRunner.cancel();
-    }
-
-    private void cancelAutoExpeditionSchedulerSilently() {
-        if (autoExpeditionSchedulerRunner != null) {
-            autoExpeditionSchedulerRunner.cancel();
-            autoExpeditionSchedulerRunner = null;
+        if (runtime.cancelActive()) {
+            minimumRunStatus.setText("已请求停止当前流程");
+        } else {
+            minimumRunStatus.setText("没有运行中的流程");
         }
     }
 
-    private void cancelMinimumNormalBattle() {
-        if (minimumNormalBattleRunner == null) {
-            minimumRunStatus.setText("最小普通战：没有运行中的流程");
+    private void runCampaignBattle() {
+        UnifiedAutomationConfig activeConfig = activeConfigOrBlockStart();
+        if (activeConfig == null) {
             return;
         }
-        minimumRunStatus.setText("最小普通战：请求停止");
-        minimumNormalBattleRunner.cancel();
-    }
-
-    private void cancelMinimumNormalRunnerSilently() {
-        if (minimumNormalBattleRunner != null) {
-            minimumNormalBattleRunner.cancel();
-            minimumNormalBattleRunner = null;
-        }
-    }
-
-    private boolean isAutoExpeditionRunning() {
-        return AutoExpeditionSchedulerRunner.shouldBlockNewFlowForAutoExpedition(
-                autoExpeditionSchedulerRunner != null && autoExpeditionSchedulerRunner.isRunning()
+        final CampaignBattleRunner runner = new CampaignBattleRunner(
+                getApplicationContext(), activeConfig.campaign, runtime
         );
-    }
-
-    private MinimumNormalBattleRunner.Callback minimumRunnerCallback() {
-        return new MinimumNormalBattleRunner.Callback() {
-            @Override
-            public void onUpdate(MinimumNormalBattleRunner.Update update) {
-                minimumRunStatus.setText(update.status);
-                minimumRunDetail.setText(update.detail);
-                minimumRunLogPath.setText("运行日志：" + (TextUtils.isEmpty(update.logPath) ? "未生成" : update.logPath));
-                minimumRunScreenshotPath.setText("失败截图：" + (TextUtils.isEmpty(update.screenshotPath) ? "未生成" : update.screenshotPath));
-                if (!update.running) {
-                    minimumNormalBattleRunner = null;
+        RunnerAutomationFlow flow = new RunnerAutomationFlow(
+                "campaign", "战役", true,
+                new RunnerAutomationFlow.Start() {
+                    @Override public boolean start() { return runner.start(); }
+                },
+                new RunnerAutomationFlow.Pause() {
+                    @Override public void pause() { runner.pause(); }
+                },
+                new RunnerAutomationFlow.Resume() {
+                    @Override public void resume() { runner.resume(); }
+                },
+                new RunnerAutomationFlow.Cancel() {
+                    @Override public void cancel() { runner.cancel(); }
+                },
+                new RunnerAutomationFlow.Running() {
+                    @Override public boolean isRunning() { return runner.isRunning(); }
                 }
-            }
-        };
+        );
+        minimumRunStatus.setText("战役：启动中");
+        minimumRunDetail.setText("默认配置：" + activeConfigProfileId
+                + "，" + activeConfig.campaign.summary());
+        minimumRunLogPath.setText("运行日志：准备生成");
+        minimumRunScreenshotPath.setText("失败截图：未生成");
+        startAutomationFlow(flow, minimumRunStatus);
     }
 
-    private AutoExpeditionSchedulerRunner.Callback autoExpeditionCallback() {
-        return new AutoExpeditionSchedulerRunner.Callback() {
-            @Override
-            public void onUpdate(ExpeditionCollectionRunner.Update update) {
-                minimumRunStatus.setText(update.status);
-                minimumRunDetail.setText(update.detail);
-                minimumRunLogPath.setText("运行日志：" + (TextUtils.isEmpty(update.logPath) ? "未生成" : update.logPath));
-                minimumRunScreenshotPath.setText("失败截图：" + (TextUtils.isEmpty(update.screenshotPath) ? "未生成" : update.screenshotPath));
-                if (!update.running) {
-                    autoExpeditionSchedulerRunner = null;
-                }
-            }
-        };
+    private UnifiedAutomationConfig activeConfigOrBlockStart() {
+        if (activeAutomationConfig != null) {
+            return activeAutomationConfig;
+        }
+        minimumRunStatus.setText("默认配置不可用");
+        String parserError = configProfileUiController == null
+                ? "配置档案尚未加载"
+                : configProfileUiController.lastError();
+        minimumRunDetail.setText(TextUtils.isEmpty(parserError) ? "请检查配置档案" : parserError);
+        return null;
     }
 
+    private void startAutomationFlow(AutomationFlow flow, TextView flowStatus) {
+        AutomationCoordinator.StartResult result = runtime.start(flow);
+        if (result.started) {
+            return;
+        }
+        String activeLabel = TextUtils.isEmpty(result.activeLabel) ? flow.label() : result.activeLabel;
+        String rejection = "正在运行：" + activeLabel;
+        minimumRunStatus.setText(rejection);
+        if (flowStatus != null) {
+            flowStatus.setText(rejection);
+        }
+    }
+
+    private void renderAutomationUpdate(AutomationUpdate update) {
+        if (update == null || minimumRunStatus == null) {
+            return;
+        }
+        minimumRunStatus.setText(update.message);
+        minimumRunDetail.setText(update.detail);
+        minimumRunLogPath.setText("运行日志："
+                + (TextUtils.isEmpty(update.logPath) ? "未生成" : update.logPath));
+        minimumRunScreenshotPath.setText("失败截图："
+                + (TextUtils.isEmpty(update.screenshotPath) ? "未生成" : update.screenshotPath));
+        runnerStatus.setText("当前流程：" + update.flowId + "，结果：" + update.outcome.name());
+        if ("guarded".equals(update.flowId)) {
+            guardedRunnerStatus.setText(update.message);
+            guardedRunnerDetail.setText(update.detail);
+        } else if ("stepper".equals(update.flowId)) {
+            guardedStepperStatus.setText(update.message);
+            guardedStepperDetail.setText(update.detail);
+        } else if ("waiter".equals(update.flowId)) {
+            liveCombatWaitStatus.setText(update.message);
+            liveCombatWaitDetail.setText(update.detail);
+        }
+    }
+
+    private static String diagnosticRunId() {
+        return String.valueOf(System.currentTimeMillis());
+    }
     private String zhLiveSpotStatus(String status) {
         if (status == null) {
             return "索敌诊断：未知";
@@ -1169,25 +1228,6 @@ public final class MainActivity extends Activity {
             return "索敌诊断自检：失败";
         }
         return "索敌诊断：" + status;
-    }
-
-    private String zhGuardedRunnerStatus(String status) {
-        if (status == null) {
-            return "受保护作战：未知";
-        }
-        if (status.contains("no guarded phase")) {
-            return "受保护作战：当前没有可执行阶段";
-        }
-        if (status.contains("finished")) {
-            return "受保护作战：已结束";
-        }
-        if (status.contains("running")) {
-            return "受保护作战：正在运行";
-        }
-        if (status.contains("cancel")) {
-            return "受保护作战：已停止";
-        }
-        return "受保护作战：" + status;
     }
 
     private void requestScreenCapture() {
